@@ -13,6 +13,79 @@ import h5py
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
+def actually_call_pos_depths(keep_reads, bam):
+    samfile = pysam.AlignmentFile(bam, "rb")
+    position_dict = {}
+    query_names = []
+    used_reads = 0
+    print("Passed reads: ", len(keep_reads))
+    #loop through all reads
+    for count,thing in enumerate(samfile): 
+        if count % 100000 == 0:
+            print(count)
+        if count not in keep_reads:
+            continue
+        #loop over each position in each read
+        for (pos, letter, ref, qual) in zip(thing.get_reference_positions(), thing.query_alignment_sequence, thing.get_reference_sequence(), thing.query_alignment_qualities):
+            #standardize this
+            letter = letter.upper()
+            ref = ref.upper()
+            pos = str(pos + 1)
+
+            #if we've seen this position before
+            if pos in position_dict:
+                #check if we've seen this nuc before
+                if letter in position_dict[pos]["allele"]:
+                    position_dict[pos]['allele'][letter]["count"] += 1
+                    position_dict[pos]['total_depth'] += 1 
+                    position_dict[pos]['allele'][letter]["qual"] += qual    
+                #else we will add the letter            
+                else:
+                    position_dict[pos]['allele'][letter] = {"count":1, 'qual':qual}
+                    position_dict[pos]['total_depth'] += 1
+
+                #handle the ref addition
+                if ref in position_dict[pos]['ref']:
+                    position_dict[pos]['ref'][ref] += 1
+                else:
+                    position_dict[pos]['ref'][ref] = 1
+                    
+            #else we'll add this position
+            else:
+                position_dict[pos] = {}
+                position_dict[pos]['ref'] = {ref:1}
+                position_dict[pos]['allele'] = {letter:{"count": 1, 'qual': qual}}
+                position_dict[pos]['total_depth'] = 1 
+            used_reads += 1
+        #if len(thing.get_reference_positions()) != len(thing.get_reference_positions(full_length=True)):
+            #print(thing.query_sequence, thing.get_reference_positions(full_length=True))
+            #let's ship it off to support function to find out if we have any insertions/deletions
+            #position_dict = find_insertions_deletions(position_dict, \
+            #    thing.get_reference_positions(full_length=True), thing.query_sequence, thing.qual)
+
+        query_names.append(thing.query_name)
+    print("Used reads: ", used_reads)
+    return(position_dict)
+
+   
+
+def call_pos_depths_read(removal_reads, bam, fileout):
+    print("Calculating subset of positional depths: ", bam)
+    #remove_reads = open(fileout, "w")
+    #read_files = open("./spike_in/bam/read_ids_0.txt", 'r')
+    used = 0
+    samfile = pysam.AlignmentFile(bam, "rb")
+    outfile = pysam.AlignmentFile(fileout.replace('.txt','.bam'), "w", template=samfile)
+    for count, line in enumerate(samfile):
+        if count % 100000 == 0:
+            print(count)
+        if count not in removal_reads:
+            outfile.write(line)
+            used += 1
+    samfile.close()
+    outfile.close()
+    print(used) 
+
 def alternate_calc_pos_depths(bam, test):
     """
     Creates a dict for each positions from pileup.
@@ -52,8 +125,8 @@ def calculate_positional_depths(bam):
     
     #loop through all reads
     for count,thing in enumerate(samfile): 
-        #if count % 100000 == 0:
-        #    print(count)
+        if count % 100000 == 0:
+            print(count)
 
         #loop over each position in each read
         for (pos, letter, ref, qual) in zip(thing.get_reference_positions(), thing.query_alignment_sequence, thing.get_reference_sequence(), thing.query_alignment_qualities):
@@ -86,7 +159,14 @@ def calculate_positional_depths(bam):
                 position_dict[pos]['ref'] = {ref:1}
                 position_dict[pos]['allele'] = {letter:{"count": 1, 'qual': qual}}
                 position_dict[pos]['total_depth'] = 1 
-        
+        """
+        if len(thing.get_reference_positions()) != len(thing.get_reference_positions(full_length=True)):
+            print(thing.query_sequence, thing.get_reference_positions(full_length=True), thing.get_reference_positions())
+            print(thing.query_alignment_sequence)
+            print(len(thing.query_sequence),len(thing.query_alignment_sequence))
+            print(dir(thing))
+            sys.exit(0)        
+        """
         #if len(thing.get_reference_positions()) != len(thing.get_reference_positions(full_length=True)):
             #print(thing.query_sequence, thing.get_reference_positions(full_length=True))
             #let's ship it off to support function to find out if we have any insertions/deletions
@@ -193,8 +273,8 @@ def calculate_read_probability(position_depths, bam, name, \
         num_muts = []
 
         for count, thing in enumerate(samfile):
-            #if count % 100000 == 0:
-            #    print(count)
+            if count % 100000 == 0:
+                print(count)
         
             temp_read_freq = [0.0]* 30000
             contam_found = False
@@ -202,9 +282,14 @@ def calculate_read_probability(position_depths, bam, name, \
             temp_log_probs = 1
             read_length = 0
             muts = 0
+            pos_found = False
             for (pos, nuc, ref, qual) in zip(thing.get_reference_positions(), \
                 thing.query_alignment_sequence, thing.get_reference_sequence(), thing.query_alignment_qualities):
                 pos = str(pos+1)
+                #if int(pos) == 23403:
+                #    print(nuc, ref, freq)
+                #    pos_found = True
+                
                 if gt_dict is not None:
                     gt = gt_dict[int(pos)]
                 nuc = nuc.upper()
@@ -217,7 +302,7 @@ def calculate_read_probability(position_depths, bam, name, \
                 total_depth = position_depths[pos]['total_depth']
                 if total_depth < 10:
                     continue
-
+                
                 #this block disgards non informative positions
                 pos_alleles = position_depths[pos]['allele']
                 pos_alleles = {k: v['count'] / total_depth for k, v in pos_alleles.items()}
@@ -239,7 +324,10 @@ def calculate_read_probability(position_depths, bam, name, \
                     #track contam reads
                     if gt == "TRUE" and (ref != nuc) and (ref == v2_ref):
                         contam_found=True
-                                
+               
+                if int(pos) == 23604:
+                    print(nuc, ref, freq, 'made it')
+                    pos_found = True
                 #we care about the actual prob in this freq range
                 temp_read_probs += freq            
                 temp_log_probs += math.log(freq)
@@ -260,7 +348,8 @@ def calculate_read_probability(position_depths, bam, name, \
                 read_probs.append(0)
             else:
                 read_probs.append(temp_read_probs/read_length)
-            
+            if pos_found:
+                print("read prob ", temp_read_probs, read_length, count)
        
         add_info_dict = {"contam_reads":contam_reads, "noncontam_reads":noncontam_reads, \
             "log_read_probs":log_read_probs, "read_probs": read_probs, "read_lengths":all_read_lengths, \
