@@ -56,7 +56,7 @@ def actually_call_pos_depths(keep_reads, bam):
                 position_dict[pos]['ref'] = {ref:1}
                 position_dict[pos]['allele'] = {letter:{"count": 1, 'qual': qual}}
                 position_dict[pos]['total_depth'] = 1 
-            used_reads += 1
+        used_reads += 1
         #if len(thing.get_reference_positions()) != len(thing.get_reference_positions(full_length=True)):
             #print(thing.query_sequence, thing.get_reference_positions(full_length=True))
             #let's ship it off to support function to find out if we have any insertions/deletions
@@ -70,6 +70,9 @@ def actually_call_pos_depths(keep_reads, bam):
    
 
 def call_pos_depths_read(removal_reads, bam, fileout):
+    """
+    DEPRICATED.
+    """
     print("Calculating subset of positional depths: ", bam)
     #remove_reads = open(fileout, "w")
     #read_files = open("./spike_in/bam/read_ids_0.txt", 'r')
@@ -286,10 +289,7 @@ def calculate_read_probability(position_depths, bam, name, \
             for (pos, nuc, ref, qual) in zip(thing.get_reference_positions(), \
                 thing.query_alignment_sequence, thing.get_reference_sequence(), thing.query_alignment_qualities):
                 pos = str(pos+1)
-                #if int(pos) == 23403:
-                #    print(nuc, ref, freq)
-                #    pos_found = True
-                
+               
                 if gt_dict is not None:
                     gt = gt_dict[int(pos)]
                 nuc = nuc.upper()
@@ -325,7 +325,7 @@ def calculate_read_probability(position_depths, bam, name, \
                     if gt == "TRUE" and (ref != nuc) and (ref == v2_ref):
                         contam_found=True
                
-                if int(pos) == 23604:
+                if int(pos) == 23271:
                     print(nuc, ref, freq, 'made it')
                     pos_found = True
                 #we care about the actual prob in this freq range

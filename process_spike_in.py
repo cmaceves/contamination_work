@@ -2,15 +2,18 @@ import os
 import sys
 import ast
 import json
+import copy
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy import stats
 import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
 from scipy import signal
+
 #other script import
-from contaminant_analysis import calculate_positional_depths, calculate_read_probability, call_pos_depths_read, \
-    actually_call_pos_depths
+from contaminant_analysis import calculate_positional_depths, \
+    calculate_read_probability, actually_call_pos_depths
 
 def process_bam_file(bam, create_new_hdf5, name, threshold):
     print("working on %s" %bam)
@@ -40,8 +43,8 @@ def main():
     #print(results)    
 
 def consensus_call(target_depths, all_depths):
-   
-    start_nuc = 21563 + (478*3)
+    #defines the spike + amino acid location to check on mutations
+    start_nuc = 21563 + (19*3)
     total = max(int(k) for k, v in all_depths.items())    
     consensus_string = [''] * total
     final_con = '' 
@@ -51,15 +54,6 @@ def consensus_call(target_depths, all_depths):
         #    print(key, value,)
     
         if key in target_depths:
-            if int(key) == 23604:
-                print(value)
-                print(target_depths[key])
-            #if int(key) == 23403:
-            #    print(value)
-            #    print(target_depths[key])
-            #if int(key) == 21618:
-                #print("delta ", target_depths[key])
-                #print(value)
             allele_dict = target_depths[key]['allele']
             total_count = target_depths[key]['total_depth']
             #if total_count < 1:
@@ -112,148 +106,201 @@ def find_best_allele(depths, key):
             return('N')
 
 def peak_pick_distributions(dfh):
-    from scipy import stats
-
+    """
+    Parallel processing peak-picking, calling consensus, and running nextclade.
+    """
     location = "./spike_in/json"
     dist_files = [os.path.join(location, item) for item in os.listdir(location) if item.endswith('.json')]
-    new_dict = {'filename':[], 'percent':[], "percent_score":[]}
-    for filename in dist_files:
-        print(filename)
-        if "file_12." not in filename:
-            continue
-        
-        with open(filename, 'r') as jfile:
-            data = json.load(jfile)
-            probs = data['read_probs']
-        
-        save_probs = probs
-        #reads that have low depth or variance so we don't care about them
-        common_reads = [count for count,item in enumerate(probs) if item == 0]
-        probs = [item for item in probs if item > 0]
-        
-        #makes kde function
-        np.random.seed(0)
-        df = pd.DataFrame(probs, columns=['data'])
+    Parallel(n_jobs=20)(delayed(process_2)(filename) for filename in dist_files)
+  
 
-        #mut at aa 19
-        delta_read = [562185, 562192, 562207]
+def process_2(filename):
+    location = "./spike_in/json"
+   
+    print("Begin working on: ", filename)
+    base_filename = filename.split("/")[-1].split(".")[0].split("_")[-2:]
+    base_filename = "_".join(base_filename)
 
-        # non-parametric pdf
-        nparam_density = stats.kde.gaussian_kde(probs)
-        x = np.linspace(0, 1, 200)
-        nparam_density = nparam_density(x)
-
-        peaks = signal.find_peaks(nparam_density, width=0.025, height=0)
-        
-        indices = peaks[0]
-        dictionaries = peaks[1]
-        heights = dictionaries['peak_heights']
-        width = dictionaries['widths']
-        prominance = dictionaries['prominences']
-        wh_list = dictionaries['width_heights']
-        final_indices = []
-        final_indices_3 = []
-        ab =sorted(zip(indices, heights, width, prominance, wh_list), key=lambda x: x[1], reverse=True)
-       
-        #create filename for match
-        filen = filename.split('/')[-1]
-        filen = filen.split('.')[0].replace("add_info_","")
-        new_dict['filename'].append(filen + '.bam')
-
-        #get ground truth
-        peak_expected_at = dfh.loc[dfh['filename'] == filen +'.bam'].values[0][-1]
-       
-        one_off_explanation = []
-        one_off_score = []
-        for index, h, w,p, wh in ab:
-            one_off_explanation.append(index/200)
-            one_off_score.append(wh)
-
-        new_dict['percent_score'].append(one_off_score)
-        new_dict['percent'].append(one_off_explanation)
-        
-        read_classification = {}
-        for thing in one_off_explanation:
-            read_classification[thing] = []
-        
-        all_useable = 0       
-        #iterate all probs and file the closest signal
-        for count,z in enumerate(save_probs): 
-            if z == 0:
-                continue
-            y = min(one_off_explanation, key=lambda x:abs(x-z))         
-            
-            if y-0.05< z < y+0.05:
-                read_classification[y].append(count)            
- 
-        print(one_off_explanation)
-        print("all reads: ", len(save_probs))
-        print("common reads: ", len(common_reads))
-        new_all = True        
-        #call consensus on whatever remains       
-        for key, value in read_classification.items():
-            #process("./spike_in/bam/"+ filen + '.calmd.bam')
-            #sys.exit(0)
-
-            print("peak: ", key, " num reads: ",len(value))
-            import copy
-            only_peak_reads = copy.deepcopy(value)
-            print(len(only_peak_reads))
-            print("should remove: ", len(save_probs) - len(common_reads) - len(value))
-            value.extend(common_reads)
-            removal_reads = set(range(0,len(save_probs))) - set(value)
-            removal_reads = list(removal_reads)
-            print("remove: ", len(removal_reads))
-            removal_filename = filen + "_" + str(key) + "_remove.txt"
-            #print("saving removal reads to: ", removal_filename)
-            #call_pos_depths_read(removal_reads, "./spike_in/bam/"+ filen + '.calmd.bam', removal_filename)
-            new_calc = True
-            
-            if new_calc:                
-                position_depths_target = actually_call_pos_depths(only_peak_reads, "./spike_in/bam/"+ filen + ".calmd.bam")
-                with open('position_depths_target.json', 'w') as jfile:
-                    json.dump({'position_depths_target':position_depths_target}, jfile) 
-            else:
-                with open('position_depths_target.json', 'r') as jfile:
-                    data = json.load(jfile)
-                position_depths_target = data['position_depths_target']
-            if new_all: 
-                new_all = False
-                position_depths_all = calculate_positional_depths("./spike_in/bam/" + filen + ".calmd.bam")
-                with open('position_depths_all.json', 'w') as jfile:
-                    json.dump({'position_depths_all':position_depths_all}, jfile)
-            else:
-                with open('position_depths_all.json', 'r') as jfile:
-                    data = json.load(jfile)
-                position_depths_all = data['position_depths_all']
-                
-            consensus_string = consensus_call(position_depths_target, position_depths_all)
-            with open("consensus_" + filen + "_" + str(key) + ".fasta", 'w') as ffile:
-                ffile.write(">%s\n" %filen)
-                ffile.write(consensus_string)  
-        sys.exit(0)
+    #check and see if we have a dir for this file
+    if os.path.isdir(base_filename):
+        pass
+    else:
+        os.system("mkdir %s" %base_filename)
+    """
+    #select a specific file to look at
+    if "file_352" in base_filename:
+        pass
+    else:
         continue
+    """
+    #open up the saved data related to read probabilties
+    with open(filename, 'r') as jfile:
+        data = json.load(jfile)
+        probs = data['read_probs']
 
-        # parametric fit: assume normal distribution
-        loc_param, scale_param = stats.norm.fit(probs)
-        param_density = stats.norm.pdf(x, loc=loc_param, scale=scale_param)
+    #reads that have low depth or variance so we don't care about them
+    #ie. zero reads gotta go!
+    common_reads = [count for count,item in enumerate(probs) if item == 0]
+    filtered_probs = [item for item in probs if item > 0]
+    
+    #makes kde function
+    np.random.seed(0)
+    df = pd.DataFrame(filtered_probs, columns=['data'])
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.hist(probs, bins=100, density=True)
-        ax.plot(x, nparam_density, 'r-', label='non-parametric density (smoothed by Gaussian kernel)')
-        ax.plot(x, param_density, 'k--', label='parametric density')
-        ax.set_ylim([0, 10])
-        ax.legend(loc='best')
-        save_name = filename.split(".")
-        save_name = save_name[:-1]
-        save_name = '.'.join(save_name) + "_smoothing"
-        plt.savefig("%s.jpg"%save_name)
-        plt.close()
+    # non-parametric pdf
+    nparam_density = stats.kde.gaussian_kde(filtered_probs)
+    x = np.linspace(0, 1, 200)
+    nparam_density = nparam_density(x)
 
-    df = pd.DataFrame(new_dict)
-    df2 = df.merge(dfh, on="filename")
-    print(df2)
-    df2.to_csv("peak_pick.csv")
+    peaks = signal.find_peaks(nparam_density, width=0.025, height=0)
+    
+    #I pulled these out for earlier analysis I did
+    indices = peaks[0]
+    dictionaries = peaks[1]
+    heights = dictionaries['peak_heights']
+    width = dictionaries['widths']
+    prominance = dictionaries['prominences']
+    wh_list = dictionaries['width_heights']
+    final_indices = []
+    final_indices_3 = []
+    ab =sorted(zip(indices, heights, width, prominance, wh_list), key=lambda x: x[1], reverse=True)
+   
+    #create filename for match
+    filen = filename.split('/')[-1]
+    filen = filen.split('.')[0].replace("add_info_","")
+    
+    one_off_explanation = []
+    for index, h, w,p, wh in ab:
+        one_off_explanation.append(index/200)
+
+    #dump some data about our peaks to a json, prior to combining peaks
+    saved_peak_data = {}
+    saved_peak_data['width-heights'] = list(wh_list)
+    saved_peak_data['peak-value'] = one_off_explanation
+    print(saved_peak_data)
+    with open("./%s/peak_information.json" %base_filename, "w") as jfile:
+        json.dump(saved_peak_data, jfile)
+
+    #lets make a blank dict with prob as key and list of counts as value
+    read_classification = {}
+    for thing in one_off_explanation:
+        read_classification[thing] = []
+     
+    all_useable = 0       
+    
+    #iterate all probs and file the closest signal
+    for count,z in enumerate(probs): 
+        #useless
+        if z == 0:
+            continue
+        y = min(one_off_explanation, key=lambda x:abs(x-z))         
+        
+        #this defines the window of what we call consensus on!
+        if y-0.05< z < y+0.05:
+            read_classification[y].append(count)            
+
+    '''there's likely a better way to do this, but here I combine close peaks and label
+    it using the high one'''
+    #figure out whats close together
+    combo_dict = {}
+    for item in one_off_explanation:
+        for x in one_off_explanation:
+            if item == x:
+                continue
+            #same window for consensus call we saw earlier
+            if item-0.05 < x < item+0.05:
+                if item in combo_dict:
+                    combo_dict[item].append(x)
+                else:
+                    combo_dict[item] = [x]
+                #we can no longer use this as a peak
+                one_off_explanation.remove(x)
+
+    read_classification_2 = {}
+    #combine things
+    seen = []
+    for key, value in read_classification.items():
+        #we have two peaks that can be combined
+        if key in combo_dict:
+            combos = combo_dict[key]
+            for thing in combos:
+                value.extend(read_classification[thing])
+                if thing not in seen:
+                    read_classification_2[key] = value
+                    seen.append(thing)
+        elif key not in seen:
+            read_classification_2[key] = value
+    
+    #call consensus on whatever remains       
+    for key, value in read_classification_2.items():
+        #process("./spike_in/bam/"+ filen + '.calmd.bam')
+        #sys.exit(0)
+        
+        print("peak: ", key, " num reads: ",len(value))
+        only_peak_reads = copy.deepcopy(value)
+      
+        #if we need to calculate a new target depth
+        new_filename_targ = './%s/position_depths_%s_target.json'%(base_filename, key)
+        new_filename_all = './%s/position_depths_all.json' %base_filename
+        if not os.path.isfile(new_filename_targ):                
+            position_depths_target = actually_call_pos_depths(only_peak_reads, "./spike_in/bam/"+ filen + ".calmd.bam")
+            with open(new_filename_targ, 'w') as jfile:
+                json.dump({'position_depths_target':position_depths_target}, jfile) 
+        else:
+            with open(new_filename_targ, 'r') as jfile:
+                data = json.load(jfile)
+            position_depths_target = data['position_depths_target']
+        if not os.path.isfile(new_filename_all):
+            position_depths_all = calculate_positional_depths("./spike_in/bam/" + filen + ".calmd.bam")
+            with open(new_filename_all, 'w') as jfile:
+                json.dump({'position_depths_all':position_depths_all}, jfile)
+        else:
+            with open(new_filename_all, 'r') as jfile:
+                data = json.load(jfile)
+            position_depths_all = data['position_depths_all']
+            
+        consensus_string = consensus_call(position_depths_target, position_depths_all)
+        with open("./%s/consensus_"%base_filename + filen + "_" + str(key) + ".fasta", 'w') as ffile:
+            ffile.write(">%s_%s_header\n" %(filen, key))
+            ffile.write(consensus_string)
+            ffile.write("\n")
+
+        #cat it on to the master file
+        cmd = "cat ./%s/consensus_%s_%s.fasta >> ./%s/finalfile.fasta" %(base_filename, filen, str(key), base_filename)
+        print(cmd)
+        os.system(cmd)          
+
+    #run nextflow on all fasta file
+    cmd = "nextclade --in-order \
+            --input-fasta ./%s/finalfile.fasta \
+            --input-dataset data/sars-cov-2 \
+            --output-tsv ./%s/nextclade.tsv \
+            --output-tree ./%s/nextclade.auspice.json \
+            --output-dir ./%s \
+            --output-basename nextclade" %(base_filename, base_filename, \
+            base_filename, base_filename)
+    
+    os.system(cmd)
+
+def make_figures(probs, loc_param, scale_param, filename):
+    """
+    This is the code that was used to make the probability figures.
+    """
+    # parametric fit: assume normal distribution
+    loc_param, scale_param = stats.norm.fit(probs)
+    param_density = stats.norm.pdf(x, loc=loc_param, scale=scale_param)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.hist(probs, bins=100, density=True)
+    ax.plot(x, nparam_density, 'r-', label='non-parametric density (smoothed by Gaussian kernel)')
+    ax.plot(x, param_density, 'k--', label='parametric density')
+    ax.set_ylim([0, 10])
+    ax.legend(loc='best')
+    save_name = filename.split(".")
+    save_name = save_name[:-1]
+    save_name = '.'.join(save_name) + "_smoothing"
+    plt.savefig("%s.jpg"%save_name)
+    plt.close()
 
 def process(bam):
     name = bam.split("/")[-1].split(".")[0]
