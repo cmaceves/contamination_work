@@ -44,14 +44,14 @@ def main():
 
 def consensus_call(target_depths, all_depths):
     #defines the spike + amino acid location to check on mutations
-    start_nuc = 21563 + (19*3)
+    start_nuc = 21563 + (677*3)
     total = max(int(k) for k, v in all_depths.items())    
     consensus_string = [''] * total
     final_con = '' 
     for key, value in all_depths.items():
         
         #if start_nuc - 4 < int(key) < start_nuc:
-        #    print(key, value,)
+        #    print(key, value, target_depths[key])
     
         if key in target_depths:
             allele_dict = target_depths[key]['allele']
@@ -111,8 +111,8 @@ def peak_pick_distributions(dfh):
     """
     location = "./spike_in/json"
     dist_files = [os.path.join(location, item) for item in os.listdir(location) if item.endswith('.json')]
-    Parallel(n_jobs=20)(delayed(process_2)(filename) for filename in dist_files)
-  
+    #Parallel(n_jobs=20)(delayed(process_2)(filename) for filename in dist_files)
+    process_2("./spike_in/json/add_info_file_352.json")
 
 def process_2(filename):
     location = "./spike_in/json"
@@ -154,6 +154,7 @@ def process_2(filename):
 
     peaks = signal.find_peaks(nparam_density, width=0.025, height=0)
     
+    
     #I pulled these out for earlier analysis I did
     indices = peaks[0]
     dictionaries = peaks[1]
@@ -181,6 +182,7 @@ def process_2(filename):
     with open("./%s/peak_information.json" %base_filename, "w") as jfile:
         json.dump(saved_peak_data, jfile)
 
+    one_off_explanation = [0.17] 
     #lets make a blank dict with prob as key and list of counts as value
     read_classification = {}
     for thing in one_off_explanation:
@@ -196,7 +198,7 @@ def process_2(filename):
         y = min(one_off_explanation, key=lambda x:abs(x-z))         
         
         #this defines the window of what we call consensus on!
-        if y-0.05< z < y+0.05:
+        if y-0.03< z < y+0.03:
             read_classification[y].append(count)            
 
     '''there's likely a better way to do this, but here I combine close peaks and label
@@ -208,7 +210,7 @@ def process_2(filename):
             if item == x:
                 continue
             #same window for consensus call we saw earlier
-            if item-0.05 < x < item+0.05:
+            if item-0.03 < x < item+0.03:
                 if item in combo_dict:
                     combo_dict[item].append(x)
                 else:
@@ -230,17 +232,18 @@ def process_2(filename):
                     seen.append(thing)
         elif key not in seen:
             read_classification_2[key] = value
-    
+    print(read_classification_2.keys())
+    #sys.exit(0)
     #call consensus on whatever remains       
     for key, value in read_classification_2.items():
-        #process("./spike_in/bam/"+ filen + '.calmd.bam')
-        #sys.exit(0)
+        process("./spike_in/bam/"+ filen + '.calmd.bam')
+        sys.exit(0)
         
         print("peak: ", key, " num reads: ",len(value))
         only_peak_reads = copy.deepcopy(value)
       
         #if we need to calculate a new target depth
-        new_filename_targ = './%s/position_depths_%s_target.json'%(base_filename, key)
+        new_filename_targ = './%s/extra_position_depths_%s_target.json'%(base_filename, key)
         new_filename_all = './%s/position_depths_all.json' %base_filename
         if not os.path.isfile(new_filename_targ):                
             position_depths_target = actually_call_pos_depths(only_peak_reads, "./spike_in/bam/"+ filen + ".calmd.bam")
@@ -260,24 +263,24 @@ def process_2(filename):
             position_depths_all = data['position_depths_all']
             
         consensus_string = consensus_call(position_depths_target, position_depths_all)
-        with open("./%s/consensus_"%base_filename + filen + "_" + str(key) + ".fasta", 'w') as ffile:
+        with open("./%s/extra_consensus_"%base_filename + filen + "_" + str(key) + ".fasta", 'w') as ffile:
             ffile.write(">%s_%s_header\n" %(filen, key))
             ffile.write(consensus_string)
             ffile.write("\n")
 
         #cat it on to the master file
-        cmd = "cat ./%s/consensus_%s_%s.fasta >> ./%s/finalfile.fasta" %(base_filename, filen, str(key), base_filename)
+        cmd = "cat ./%s/extra_consensus_%s_%s.fasta >> ./%s/extra_finalfile.fasta" %(base_filename, filen, str(key), base_filename)
         print(cmd)
         os.system(cmd)          
 
     #run nextflow on all fasta file
     cmd = "nextclade --in-order \
-            --input-fasta ./%s/finalfile.fasta \
+            --input-fasta ./%s/extra_finalfile.fasta \
             --input-dataset data/sars-cov-2 \
-            --output-tsv ./%s/nextclade.tsv \
-            --output-tree ./%s/nextclade.auspice.json \
+            --output-tsv ./%s/extra_nextclade.tsv \
+            --output-tree ./%s/extra_nextclade.auspice.json \
             --output-dir ./%s \
-            --output-basename nextclade" %(base_filename, base_filename, \
+            --output-basename extra_nextclade" %(base_filename, base_filename, \
             base_filename, base_filename)
     
     os.system(cmd)

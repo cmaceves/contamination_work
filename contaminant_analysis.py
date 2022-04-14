@@ -129,8 +129,8 @@ def calculate_positional_depths(bam):
     #loop through all reads
     for count,thing in enumerate(samfile): 
         if count % 100000 == 0:
-            print(count)
-
+            #print(count)
+            pass
         #loop over each position in each read
         for (pos, letter, ref, qual) in zip(thing.get_reference_positions(), thing.query_alignment_sequence, thing.get_reference_sequence(), thing.query_alignment_qualities):
             #standardize this
@@ -263,10 +263,11 @@ def calculate_read_probability(position_depths, bam, name, \
     print("Begin calculating read probabilties: ", bam)
     
     samfile = pysam.AlignmentFile(bam, "rb") 
+    
     if create_new_hdf5:
         f = h5py.File('myfile_%s.hdf5' %name,'w')
+        #if not log_letters:
         dset = f.create_dataset("default", (1,30000), maxshape=(2700000,30000), chunks=True, compression="gzip")
-        
         #we mark the read we think have "contam" nucs
         contam_reads = []
         noncontam_reads = []
@@ -277,9 +278,9 @@ def calculate_read_probability(position_depths, bam, name, \
 
         for count, thing in enumerate(samfile):
             if count % 100000 == 0:
-                print(count)
-        
-            temp_read_freq = [0.0]* 30000
+                #print(count)
+                pass 
+            temp_read_freq = [-1]* 30000
             contam_found = False
             temp_read_probs = 0
             temp_log_probs = 1
@@ -304,34 +305,39 @@ def calculate_read_probability(position_depths, bam, name, \
                     continue
                 
                 #this block disgards non informative positions
+                """
                 pos_alleles = position_depths[pos]['allele']
                 pos_alleles = {k: v['count'] / total_depth for k, v in pos_alleles.items()}
                 pos_alleles = {k:v for (k,v) in pos_alleles.items() if v > 0.03 and k != ref} 
                 if len(pos_alleles) == 0:
                     continue            
-                
+                """
+
                 #let's try taking only the pos that don't match the refs
                 if (ref != nuc):
                     muts += 1
                 else:
+                    temp_read_freq[int(pos)] = 0.0
                     continue
+
                 read_length += 1
                 allele_depth = position_depths[pos]['allele'][nuc]['count'] 
                 freq = allele_depth/total_depth
-                temp_read_freq[int(pos)] += freq
+                temp_read_freq[int(pos)] = freq
      
                 if name == 'mix10':
                     #track contam reads
                     if gt == "TRUE" and (ref != nuc) and (ref == v2_ref):
                         contam_found=True
                
-                if int(pos) == 23271:
-                    print(nuc, ref, freq, 'made it')
-                    pos_found = True
+                #if int(pos) == 23593:
+                #    print(nuc, ref, freq, 'made it')
+                #    pos_found = True
                 #we care about the actual prob in this freq range
+                
                 temp_read_probs += freq            
                 temp_log_probs += math.log(freq)
-                
+           
             dset[count:count+1] = np.array(temp_read_freq)
             dset.resize(count+2, axis=0)
             if contam_found:
@@ -347,6 +353,8 @@ def calculate_read_probability(position_depths, bam, name, \
             if read_length == 0:
                 read_probs.append(0)
             else:
+                #print(temp_read_freq[:100], temp_read_probs/read_length) 
+                #sys.exit(0)
                 read_probs.append(temp_read_probs/read_length)
             if pos_found:
                 print("read prob ", temp_read_probs, read_length, count)
@@ -372,7 +380,8 @@ def calculate_read_probability(position_depths, bam, name, \
     noncontam_reads = data['noncontam_reads']
     num_muts = data['num_muts']
     read_length = data['read_lengths'] 
-   
+  
+    """ 
     print('creating visual')
     contam_probs = []
     noncontam_probs = []
@@ -410,7 +419,7 @@ def calculate_read_probability(position_depths, bam, name, \
     plt.title("comparing %s avg prob of reads for informative pos" %name)
     plt.savefig("/home/chrissy/contam_work/spike_in/images/%s.jpg" %name)
     plt.close()
-        
+    """ 
     return
     
  
