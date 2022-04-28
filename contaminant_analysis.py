@@ -1,6 +1,7 @@
 import os
 import math
 import copy
+import time
 import sys
 import statistics
 import pandas as pd
@@ -69,26 +70,6 @@ def actually_call_pos_depths(keep_reads, bam):
 
    
 
-def call_pos_depths_read(removal_reads, bam, fileout):
-    """
-    DEPRICATED.
-    """
-    print("Calculating subset of positional depths: ", bam)
-    #remove_reads = open(fileout, "w")
-    #read_files = open("./spike_in/bam/read_ids_0.txt", 'r')
-    used = 0
-    samfile = pysam.AlignmentFile(bam, "rb")
-    outfile = pysam.AlignmentFile(fileout.replace('.txt','.bam'), "w", template=samfile)
-    for count, line in enumerate(samfile):
-        if count % 100000 == 0:
-            print(count)
-        if count not in removal_reads:
-            outfile.write(line)
-            used += 1
-    samfile.close()
-    outfile.close()
-    print(used) 
-
 def alternate_calc_pos_depths(bam, test):
     """
     Creates a dict for each positions from pileup.
@@ -104,7 +85,7 @@ def alternate_calc_pos_depths(bam, test):
             if not pile.is_del and not pile.is_refskip:
                print(pile.alignment.query_sequence[pile.query_position])
                sys.exit(0)
-
+#@profile
 def calculate_positional_depths(bam):
     """
     Creates a dict for each position with nucs, depths, and qual.
@@ -125,11 +106,146 @@ def calculate_positional_depths(bam):
       
     unique_headers = []
     position_dict = {}    
+    seen_reads = [] 
     
-    #loop through all reads
+    """
+    for fullcount, pileupcolumn in enumerate(samfile.pileup("NC_045512.2")):
+        if fullcount % 100 == 0 and fullcount > 0:
+            print(fullcount)
+            break 
+        for pileupread in pileupcolumn.pileups:
+            if pileupread.alignment.qname in seen_reads:
+                continue
+            else:
+                seen_reads.append(pileupread.alignment.qname)
+    """
+    past_r = ''
+    for fullcount, pileupread in enumerate(samfile):
+        if fullcount % 100000 == 0:
+            if fullcount > 0:
+                pass
+                #print(fullcount)
+        cigar = pileupread.cigartuples
+        cigar = [list(x) for x in cigar]
+
+        start = pileupread.query_alignment_start
+        end = pileupread.query_alignment_end
+        pos = pileupread.get_reference_positions(full_length=True)[start:end]
+        
+        #if the length is different their's an insertion
+        ref_seq = pileupread.get_reference_sequence()
+        ref_pos = pileupread.get_reference_positions()
+
+        seq = pileupread.query_alignment_sequence 
+        total_ref = pileupread.get_reference_positions(full_length=True)
+        
+        insertion=''
+       
+        finished=False
+        on_insertion=False       
+        for count, (r, q, qual) in enumerate(zip(total_ref, pileupread.query_sequence, \
+            pileupread.query_qualities)):
+            total=0                                   
+
+            #this tells you what it should be based on the cigar, but if it doesn't land
+            #in the del range you remove prior deletiosn from the cig
+            for x in cigar:
+                if x[0] == 2 or x[0] == 5:
+                    continue
+                total += x[1]
+                if total > count:
+                    cigtype = x[0]
+                    break
+            if cigtype == 0:
+                if on_insertion:
+                   stored_nuc = insertion
+                   past_r = total_ref[count-len(stored_nuc)-1]                      
+                   #print(stored_nuc, len(stored_nuc), past_r, total_ref, count, cigar) 
+                nuc_add = q.upper() 
+                #print(cigtype, cigar, count, total_ref, ref_pos, r, count)
+                rloc = ref_pos.index(r)
+                ref = ref_seq[rloc].upper()
+                finished=True
+                if past_r is None:
+                    past_r = r-1
+            #if we have an insertion we have no reference
+            elif cigtype == 1:
+                on_insertion = True
+                finished=False
+                insertion += q.upper()                
+            #if we have a deletion, the reference is the same as the nucs
+            elif cigtype == 2:
+                continue
+            elif cigtype == 4:
+                continue
+            else:
+                print(cigar)
+                print(len(total_ref), len(pileupread.query_alignment_sequence))
+                print(cigtype)
+                print("cig type not accounted for")
+                sys.exit(0)
+            #if we aren't finished, keep iterating
+            if not finished:
+                continue
+            if r is None or str(r) == "null":
+                print(r, count, total_ref, cigar)
+            #if we are finished, we add the match either way
+            if not on_insertion:
+                if  r not in position_dict:
+                    position_dict[r] = {}
+                    position_dict[r]['ref'] = {ref:1}
+                    position_dict[r]['allele'] = {nuc_add:{"count": 1, 'qual': qual}}
+                    position_dict[r]['total_depth'] = 1
+                else: 
+                    #check if we've seen this nuc before
+                    if nuc_add in position_dict[r]["allele"]:
+                        position_dict[r]['allele'][nuc_add]["count"] += 1
+                        position_dict[r]['total_depth'] += 1 
+                        position_dict[r]['allele'][nuc_add]["qual"] += qual    
+                    #else we will add the letter            
+                    else:
+                        position_dict[r]['allele'][nuc_add] = {"count":1, 'qual':qual}
+                        position_dict[r]['total_depth'] += 1
+                    #handle the ref addition
+                    if ref in position_dict[r]['ref']:
+                        position_dict[r]['ref'][ref] += 1
+                    else:
+                        position_dict[r]['ref'][ref] = 1
+            if on_insertion:
+                if past_r is None:
+                    print(stored_nuc, r, total_ref, cigar)
+                r = past_r              
+                #insertion at an unseen position  
+                if r not in position_dict and on_insertion:
+                    store_nuc = "+"+stored_nuc
+                    position_dict[r] = {}
+                    position_dict[r]['ref'] = {}
+                    position_dict[r]['allele'] = {store_nuc:{"count": 1, 'qual': qual}}
+                    position_dict[r]['total_depth'] = 1
+                    on_insertion=False
+                    insertion=''
+                    stored_nuc=''
+                #we have an insertion at a position we've seen before
+                elif r in position_dict and on_insertion:
+                    store_nuc = "+"+stored_nuc
+                    if store_nuc in position_dict[r]["allele"]:
+                        position_dict[r]['allele'][store_nuc]["count"] += 1
+                        position_dict[r]['total_depth'] += 1 
+                        position_dict[r]['allele'][store_nuc]["qual"] += qual    
+                    #else we will add the letter            
+                    else:
+                        position_dict[r]['allele'][store_nuc] = {"count":1, 'qual':qual}
+                        position_dict[r]['total_depth'] += 1
+                    on_insertion=False
+                    insertion=''
+                    stored_nuc=''
+ 
+    return(position_dict)               
+    sys.exit(0)   
     for count,thing in enumerate(samfile): 
         if count % 100000 == 0:
             #print(count)
+            #break
             pass
         #loop over each position in each read
         for (pos, letter, ref, qual) in zip(thing.get_reference_positions(), thing.query_alignment_sequence, thing.get_reference_sequence(), thing.query_alignment_qualities):
@@ -162,22 +278,7 @@ def calculate_positional_depths(bam):
                 position_dict[pos]['ref'] = {ref:1}
                 position_dict[pos]['allele'] = {letter:{"count": 1, 'qual': qual}}
                 position_dict[pos]['total_depth'] = 1 
-        """
-        if len(thing.get_reference_positions()) != len(thing.get_reference_positions(full_length=True)):
-            print(thing.query_sequence, thing.get_reference_positions(full_length=True), thing.get_reference_positions())
-            print(thing.query_alignment_sequence)
-            print(len(thing.query_sequence),len(thing.query_alignment_sequence))
-            print(dir(thing))
-            sys.exit(0)        
-        """
-        #if len(thing.get_reference_positions()) != len(thing.get_reference_positions(full_length=True)):
-            #print(thing.query_sequence, thing.get_reference_positions(full_length=True))
-            #let's ship it off to support function to find out if we have any insertions/deletions
-            #position_dict = find_insertions_deletions(position_dict, \
-            #    thing.get_reference_positions(full_length=True), thing.query_sequence, thing.qual)
-
-        query_names.append(thing.query_name)
-    
+   
     return(position_dict)
 
 def find_insertions_deletions(position_dict, reference_positions, query_sequence, query_qual):
