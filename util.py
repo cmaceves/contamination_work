@@ -14,6 +14,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
+
 def calculate_positional_depths(bam, dropped_reads=None):
     """
     Creates a dict for each position with nucs, depths, and qual.
@@ -57,37 +58,45 @@ def calculate_positional_depths(bam, dropped_reads=None):
         #get cigar values
         cigar = pileupread.cigartuples
         cigar = [list(x) for x in cigar]
-       
+        expand_cigar = []
+        for temp_cig in cigar:
+            expand_cigar.extend([temp_cig[0]]*temp_cig[1])
+
         #if the length is different their's an insertion
         ref_seq = pileupread.get_reference_sequence()
         ref_pos = pileupread.get_reference_positions()
 
         seq = pileupread.query_alignment_sequence 
+
+        total_query = list(pileupread.query_sequence)
         total_ref = pileupread.get_reference_positions(full_length=True)
-        
+        total_qualities = list(pileupread.query_qualities)
+        for count, cig in enumerate(expand_cigar):
+            if cig == 2:
+                total_query.insert(count, None)
+                total_ref.insert(count, None)
+                total_qualities.insert(count, None)
+
         insertion=''
        
         finished=False
-        on_insertion=False       
-        for count, (r, q, qual) in enumerate(zip(total_ref, pileupread.query_sequence, \
-            pileupread.query_qualities)):
-            total=0                                   
+        on_insertion=False
+        #if pileupread.reference_start < 22000:
+        #    continue
 
-            #this tells you what it should be based on the cigar, but if it doesn't land
-            #in the del range you remove prior deletiosn from the cig
-            for x in cigar:
-                if x[0] == 2 or x[0] == 5:
-                    continue
-                total += x[1]
-                if total > count:
-                    cigtype = x[0]
-                    break
+        #if these things aren't equal something is wrong
+        if len(total_ref) != len(total_query) != len(total_qualities) != len(expand_cigar):
+            print("error.")
+            sys.exit(1)
+        for count, (r, q, qual, cigtype) in enumerate(zip(total_ref, total_query, \
+            total_qualities, expand_cigar)):           
+            if cigtype == 2 or cigtype == 5 or cigtype == 4:
+                continue
             if cigtype == 0:
                 if on_insertion:
                    stored_nuc = insertion
-                   past_r = total_ref[count-len(stored_nuc)-1]                      
-                    
-                nuc_add = q.upper() 
+                   past_r = total_ref[count-len(stored_nuc)-1]                          
+                nuc_add = q.upper()
                 rloc = ref_pos.index(r)
                 ref = ref_seq[rloc].upper()
                 finished=True
@@ -99,20 +108,14 @@ def calculate_positional_depths(bam, dropped_reads=None):
                 on_insertion = True
                 finished=False
                 insertion += q.upper()                
-            #if we have a deletion, the reference is the same as the nucs
-            elif cigtype == 2:
-                continue
-            elif cigtype == 4:
-                continue
-            else:
-                print("cig type not accounted for ", cigtype)
-                sys.exit(0)
-
+            
             #if we aren't finished, keep iterating
             if not finished:
                 continue
             if r is None or str(r) == "null":
-                print(r, count, total_ref, cigar)
+                #print(r, count, total_ref, cigar)
+                continue
+
             #if we are finished, we add the match either way
             if not on_insertion:
                 if  r not in position_dict:
@@ -165,3 +168,17 @@ def calculate_positional_depths(bam, dropped_reads=None):
                     stored_nuc=''
  
     return(position_dict)               
+
+def find_poor_amplicons(frequency_dictionary):
+    """
+    Parameters
+    ----------
+    Returns
+    -------
+
+    Function takes in a dictionary containing frequencies of haplotypes and mutations and 
+    determines which amplicons have a poor primer binding.
+    """
+     
+    pass
+

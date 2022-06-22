@@ -22,10 +22,9 @@ def warn(*args, **kwargs):
     pass
 
 warnings.warn = warn
-silent = False
 
-def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner, \
-        noise_dict, pos_dict, primer_drops):
+def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
+        noise_dict, pos_dict, primer_drops=None):
     """
     Parameters
     -----------
@@ -35,7 +34,18 @@ def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner,
         The star pos of the forward primer
     primer_1 : int
         The end pos of the reverse primer
+
+    Returns
+    -------
+
+    Function takes in bam file locations, primer locations, and nucleotides to ignore by position and 
+    returns the relative propotion of amplicon level haplotypes observed and positions in which mutations
+    occur. 
     """
+    #adjust for ends of possible reads
+    primer_0 -= 1
+    primer_1 += 1 
+   
     #encoded nucs, 0 means match ref
     encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5}
 
@@ -49,7 +59,6 @@ def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner,
     read_matrix = []
     #freq for this amp
     freq_matrix=[]
-    
     #qualities for this amp
     quality_matrix = []
  
@@ -59,94 +68,97 @@ def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner,
     
     #make sure we don't get a pair twice
     seen_reads = []
-    names_taken = []
+    total_count = 0
 
-    #parse out the names and primer directions to drop due to mismatch
-    primer_list = primer_drops[str(primer_0)]
-    primer_drop_dict={}
-    for pl in primer_list:
-        name = pl.split(" ")[0]
-        direction = pl.split(" ")[-1]
-        primer_drop_dict[name] = direction
-
-    for pileupcolumn in samfile.pileup("NC_045512.2"):
+    #create pileup
+    for pileupcolumn in samfile.pileup("NC_045512.2", start=primer_0, stop=primer_1):
         for pileupread in pileupcolumn.pileups:
-            #print(primer_0, primer_0_inner, primer_1, primer_1_inner)
-            #print(pileupread.alignment.get_reference_positions())
+            #-1 denote soft clipping or not observed
             amp = [-1]*amp_len
             freq = [-1]*amp_len
             quality = [0.0] *amp_len
+            qualifies = False
 
-            #figure out direction
-            direction = ''
-            if pileupread.alignment.is_reverse:
-                direction = 'R'
+            #determine the read direction
+            reverse = pileupread.alignment.is_reverse
+            if reverse:
+                primer_direction = 'R'
+                if  pileupread.alignment.reference_end -10 < primer_1_inner < pileupread.alignment.reference_end + 10:
+                    qualifies = True
             else:
-                direction = 'F'
+                primer_direction = 'F'
+                if  pileupread.alignment.reference_start -10 < primer_0_inner < pileupread.alignment.reference_start + 10:
+                    qualifies = True            
             
-            #we ignore reads that have primer mismatches 
-            if (pileupread.alignment.qname in list(primer_drop_dict.keys())) \
-                    and (primer_drop_dict[pileupread.alignment.qname] == direction):              
+            #ignore if we're seen this read before
+            if pileupread.alignment.qname+"_"+primer_direction in seen_reads:
                 continue
-            
-            if pileupread.alignment.qname+"_"+direction in seen_reads: 
-                continue
-            if pileupread.alignment.reference_start >= primer_0 and pileupread.alignment.reference_end <= primer_1:
-                seen_reads.append(pileupread.alignment.qname+"_"+direction)
-                positions = pileupread.alignment.get_reference_positions(full_length=True)
-                query_seq = pileupread.alignment.query_sequence
-                query_qual = pileupread.alignment.query_qualities
-                seen_reads.append(pileupread.alignment.qname)
+
+            #read belongs to amplicon we're looking at
+            if qualifies:
+                seen_reads.append(pileupread.alignment.qname+"_"+primer_direction)               
+
+                total_ref = pileupread.alignment.get_reference_positions(full_length=True)
+                total_query = list(pileupread.alignment.query_sequence)
+                total_qualities = list(pileupread.alignment.query_qualities)
+
                 cigar = pileupread.alignment.cigartuples
                 cigar = [list(x) for x in cigar]
-              
+                expand_cigar = []
+
+                for temp_cig in cigar:
+                    expand_cigar.extend([temp_cig[0]]*temp_cig[1]) 
+
+                for count, cig in enumerate(expand_cigar):
+                    if cig == 2:
+                        total_query.insert(count, None)
+                        total_ref.insert(count, None)
+                        total_qualities.insert(count, None)
+
+                #used to track blocks of deletions and insertions
                 store_nuc=''
                 on_insertion=False
-                
-                for pcount,(pos,nuc,qual) in enumerate(zip(positions, query_seq, query_qual)):
+                on_deletion=False
+
+                for pcount,(pos,nuc,qual,cigtype) in enumerate(zip(total_ref, total_query, total_qualities, expand_cigar)):
+                    if pos not in amp_indexes:
+                        continue
+
                     #if we have an insertion we create a seperate encoding for it, and place it in
                     nuc = nuc.upper()
-              
-                    total=0 
-                    for x in cigar:
-                        if x[0] == 2 or x[0] == 5:
-                            continue
-                        total += x[1]
-                        if total > pcount:
-                            cigtype = x[0]
-                            break
+                    
                     if cigtype == 1:
                         on_insertion = True
                         store_nuc += nuc.upper()
                         continue
-                    if cigtype == 4:
+                    if cigtype == 4 or cigtype == 5:
                         continue
-                    #test code
-                    if pos != None and on_insertion is False:
-                        pass
+
+                    if cigtype == 2:
+
                     #we've hit the end of the insertion
-                    elif pos != None and on_insertion is True:
+                    elif cigtype == 0 and on_insertion is True:
                         new_value = max(encoded_nucs, key=encoded_nucs.get) 
                         nuc = '+'+store_nuc
                         encoded_nucs[nuc] = encoded_nucs[new_value]+1
                         on_insertion = False
                         pos = pcount - len(store_nuc)
                         store_nuc =''
+   
                     if pos in amp_indexes:
                         if int(pos) in noise_dict:
                             noise = noise_dict[int(pos)]
-                            #this base is noise or reference
-                            if nuc in noise:
+                            if nuc in noise:                           
                                 loc = amp_indexes.index(pos)
                                 amp[loc] = 0.0
-                                freq[loc]=0.0
+                                freq[loc] = 0.0
                                 continue
+
                         loc = amp_indexes.index(pos)
                         amp[loc] = encoded_nucs[nuc]
                         quality[loc] += qual   
                         try:
                             #then we go find the overall freq
-                            #print(pos_dict[str(pos)], nuc)
                             temp = pos_dict[str(pos)]['allele'][nuc]['count']/pos_dict[str(pos)]['total_depth']
                             if temp > 0.97:
                                 loc = amp_indexes.index(pos)
@@ -156,26 +168,19 @@ def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner,
                                 continue
                             else:
                                 freq[loc]=temp
+                                
                         except:
                             pass
                             #print("failed to find " + str(pos) + " in " + bam + " pos dict")
                            
                 found_amps += 1           
-                #print('fa: ', found_amps)
-                #if np.count_nonzero(amp) == 0:
-                #    continue 
-                names_taken.append(pileupread.alignment.qname)
+ 
                 #once we've added all the pos to the read array, we append to the matrix
                 read_matrix.append(amp)
                 freq_matrix.append(freq)
                 quality_matrix.append(quality)
-    #print('found amps: ', found_amps)
-    
-    #return(found_amps)
 
-    #print("%s amplicons found" %found_amps)
     read_matrix=np.array(read_matrix)
-    print(read_matrix.T.shape) 
     freq_matrix=np.array(freq_matrix)
     quality_matrix=np.array(quality_matrix)
 
@@ -185,23 +190,40 @@ def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner,
     poi = []
     #position of interest within this matrix
     relative_poi=[]
-     
+
     #iterate by position
     for c, (pos_array, qual_array) in enumerate(zip(read_matrix.T, quality_matrix.T)):
-        filter_zeros = pos_array[pos_array>0] 
-        if len(filter_zeros) < 1:
+        gt_pos = c+primer_0
+        if gt_pos != 23603:
             continue
-        #print(c+primer_0, pos_array)
+        #positions that match the reference
+        match_ref = pos_array[pos_array==0]
+        #positions that are soft clipped
+        soft_clipped = pos_array[pos_array==-1]
+        #positions that have mutations
+        mutations = pos_array[pos_array>0]
+
+
+        #if we don't have mutations here we don't care
+        if len(mutations) == 0:
+            continue
+        print("soft clipped:", len(soft_clipped))
+        print("match ref:", len(match_ref))
+        print("mutations:", len(mutations))
+
+        
         #remover blank values from quality
         filter_qual = qual_array[qual_array>0]
         #find the average quality here
         avg_qual = np.average(filter_qual)
         if avg_qual < 20:
             continue        
-        total_depth = len(pos_array)
-        values, counts = np.unique(filter_zeros, return_counts=True)
+        #depth doesn't include the softclipped
+        total_depth = len(match_ref) + len(mutations)
+
+        values, counts = np.unique(mutations, return_counts=True)
         percent = [x/total_depth for x in counts]
-        
+        #remove low level mutations
         final = [z for z in zip(percent, values) if z[0] > 0.03]
         if len(final) > 0:
             relative_poi.append(c)
@@ -209,72 +231,50 @@ def extract_amplicons(bam, primer_0, primer_1+1, primer_0_inner, primer_1_inner,
         num_groups.append(len(final))
         final_tuples.append(final)
  
-    if len(num_groups) != 0:
-        max_number_groups = max(num_groups)
-        average_number_groups = np.average(num_groups)
-        variance_number_groups = np.var(num_groups)
-        percent_breakdown = [0.0]*round(average_number_groups)
-        for thing in final_tuples:
-            thing.sort(key=lambda y: y[0], reverse=True)
-            for i,percent in enumerate(thing):
-                if i >= round(average_number_groups):
-                    break                
-                percent_breakdown[i]+=percent[0]
-        percent_breakdown = [x/len(num_groups) for x in percent_breakdown]
-    else:
-        max_number_groups = 0
-        average_number_groups = 0
-        percent_breakdown =[0]
-        variance_number_groups = 0
-
     if read_matrix.ndim < 2:
         read_matrix = np.zeros((0,0))  
    
     max_groups = []
-    group_counts = []
-    #if our max number of groups is > 1, let's do some clustering!
-    if max_number_groups > 0:
+    group_counts=[]
+    if len(relative_poi) > 0:
         filter_matrix = freq_matrix.T[relative_poi]
         read_matrix_filt = read_matrix.T[relative_poi]
         quality_matrix_filt = quality_matrix.T[relative_poi]
-        groups = []
-        groups2 = []
-        #print(filter_matrix)
-        #sys.exit(0)
-        cc=0
-        #print(filter_matrix.T)
-        for thing,thing2,qual in zip(filter_matrix.T, read_matrix_filt.T, quality_matrix.T):
-            #not covered or soft clipped
+
+        if filter_matrix.shape != read_matrix_filt.shape != quality_matrix_filt.shape:
+            print("error in matrix shape.")
+            sys.exit(1)
+
+        #string rep
+        groups =[]
+        #float rep
+        groups2=[]
+        #total used
+        cc = 0
+        for count, (thing) in enumerate(filter_matrix.T):
+            #not covered or soft clipped, skip it, and later we'll place it in nearest group
             if -1 in thing:
                 continue
-            cc+=1
-            if str(thing) not in groups:
-                groups.append(str(thing))
+            cc += 1
+            thing = [str(x) for x in list(thing)]
+            stringify = '-'.join(thing)
+            thing = [float(x) for x in thing]
+            if stringify not in groups:
+                groups.append(stringify)
                 groups2.append(list(thing))
                 group_counts.append(1)
             else:
-                loc = groups.index(str(thing))
+                loc = groups.index(stringify)
                 group_counts[int(loc)] += 1
-                continue 
-        for a in groups2:
-            a = [float(x) for x in a]
-            max_groups.append(a)
-
-    #cc represents depth where it's not soft clipped
-    #change made for json folder and json_primers folder
+                 
+    group_percents = [x/cc for x in group_counts]     
     
-    group_percents = [x/cc for x in group_counts]
-        
-    """
     for i,(mg, gc) in enumerate(zip(max_groups, group_percents)):
         if np.count_nonzero(mg) == 0:
             max_groups.remove(mg)
             group_percents.remove(gc)
-    """
-    print("POI",poi, "group percents", group_percents, "max groups", max_groups, \
-            "group counts", group_counts, "found amps", found_amps)
-    sys.exit(0)
-    return(poi, group_percents, max_groups,found_amps)
+
+    return(poi, group_percents, found_amps)
 
 
 def get_primers(primer_file):
@@ -373,7 +373,7 @@ def main():
     #sys.exit(0)
 
     #this line is used for testing
-    process("/home/chrissy/Desktop/retrimmed_bam/file_124.final.bam")
+    process("/home/chrissy/Desktop/retrimmed_bam/file_124.sorted.final.bam")
     sys.exit(0)
     
     #creates the .csv file with thresholds and other info 
@@ -740,6 +740,8 @@ def process(bam):
     masked_output_dir = "../masked"
     primer_drop_dir = "../primer_drops"
     
+    """
+    #this block calls get masked and variants
     variants_check = os.path.join(variants_output_dir, "variants_"+basename+".tsv")
     if not os.path.isfile(variants_check):
         #call the ivar variants and generate .tsv
@@ -750,50 +752,26 @@ def process(bam):
         #call getmasked to get the primer mismatches
         call_getmasked(bam, basename, variants_output_dir, bed_filepath, \
             primer_pair_filepath, masked_output_dir)
-
+    """
     primer_dict, primer_dict_inner  = get_primers(primer_file)
-   
-    #using the mismatched primers, find reads we want ot ignore
-    #parse_mismatched_primers(basename, masked_output_dir, bam, primer_drop_dir, \
-    #        bed_filepath, primer_dict)
-    #sys.exit(0)
-
-    #check if we've already processed this file
-    #if os.path.isfile("../json_primers/%s.json" %basename):
-    #    return(0)
-
-    with open("../primer_drops/"+basename+".json", "r") as jfile:
-        primer_drops = json.load(jfile)
-    #print(len(np.unique(primer_drops["23514"])))
-    #sys.exit(0)
-    dropped_reads = [x for xs in list(primer_drops.values()) for x in xs] 
-    
-    if not os.path.isfile("../pos_depths_pd/%s_pos_depths.json" %basename):
-        total_pos_depths = calculate_positional_depths(bam, dropped_reads) 
-        with open("../pos_depths_pd/%s_pos_depths.json" %basename, "w") as jfile:
-            json.dump(total_pos_depths, jfile)
-    else:
-         with open("../pos_depths_pd/%s_pos_depths.json" %basename, "r") as jfile:
-            total_pos_depths_pd = json.load(jfile)
-        
+      
     if not os.path.isfile("../pos_depths/%s_pos_depths.json" %basename): 
         try:
             total_pos_depths = calculate_positional_depths(bam)
             with open("../pos_depths/%s_pos_depths.json" %basename, "w") as jfile:
-                json.dump(total_pos_depths, jfile)
+                json.dump(total_pos_depths, jfile) 
         except:
             return(1)
     else:
         with open("../pos_depths/%s_pos_depths.json" %basename, "r") as jfile:
             total_pos_depths = json.load(jfile)
-    sys.exit(0)
+    
     encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5}
     noise_dict = {}
-
-    #try: 
     print_list = []
+
     #convert this into a positional noise deck
-    for k,v in total_pos_depths_pd.items():
+    for k,v in total_pos_depths.items():
         if int(k) in print_list:
             print(k, v)
         noise_dict[int(k)] = []
@@ -805,22 +783,16 @@ def process(bam):
             if count['count']/total_depth < 0.03:
                 noise_dict[int(k)].append(nt)
      
-    #checkout this 
-    #28800 and 28940
-    #open and parse the bed file
     #gives us matches of primers by name
     primer_dict, primer_dict_inner  = get_primers(primer_file)
  
-    p_bam=[]
     p_0=[]
     p_1=[]
     p_0_inner=[]
     p_1_inner=[] 
     count = 0
     file_level_dict = {}
-    #print(primer_dict)
-    #sys.exit(0)
-    
+   
     #this would be a good place to parallelize
     for k,v in primer_dict.items():   
         primer_0 = int(v[0])
@@ -829,10 +801,10 @@ def process(bam):
         primer_0_inner = int(primer_dict_inner[k][0])
         primer_1_inner = int(primer_dict_inner[k][1])
      
+        #TEST LINE
         if primer_0 != 23514:
             continue
-        #if primer_0 != 14571:
-        #    continue 
+ 
         #we didn't successfully find a primer pair
         if primer_0 == 0.0 or primer_1 == 0.0 or primer_0_inner == 0 or primer_1_inner ==0:
             continue    
@@ -840,21 +812,16 @@ def process(bam):
         p_1.append(primer_1)
         p_0_inner.append(primer_0_inner)
         p_1_inner.append(primer_1_inner)
-        p_bam.append(bam) 
-        poi, groups_percents, max_groups,found_amps = extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, noise_dict, total_pos_depths_pd, primer_drops)
+        poi, groups_percents, found_amps = extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, noise_dict, total_pos_depths)
 
         amplicon_level_dict = { "poi":poi, \
-            "groups_percents": groups_percents, "found_amps": int(found_amps), \
-            "max_groups":max_groups}
+            "haplotype_percents": groups_percents, "found_amps": int(found_amps), \
+            }
         file_level_dict[primer_0] = amplicon_level_dict
-    print(file_level_dict)
-    sys.exit(0)
+    
     with open("../json_primers/primers_%s.json" %basename, "w") as jfile:
         json.dump(file_level_dict, jfile)
     return(0)
-    #except:
-    #    print("failed ", basename)
-    #    return(1)
 
 def group_files_analysis(file_folder):  
     """
@@ -1188,121 +1155,7 @@ def group_files_analysis(file_folder):
     df_outcome = df_outcome.reset_index()
     final_df = df_outcome.merge(meta_df, on='index', how='left')
     final_df.to_csv("snv_output.csv")
-
-def random_vis_code():    
-    #look at relationship between accuracy and sil score
-    correct = []
-    for index, row in final_df.iterrows():
-        if row['abundance_len'] != row['sil_opt_cluster']:
-            correct.append('incorrect cluster num')
-        else:
-            correct.append('correct cluster num')
-    
-    sil_score = final_df['sil'].tolist()
-    sns.set_style("whitegrid")
-    sns.violinplot(x=correct, y=sil_score)
-    plt.ylabel("Sil Score")
-    plt.xlabel("Correct/Incorrectly predicted # clusters")
-    plt.title("Relationship between weighed score accuracy and Sil Score")
-    plt.savefig("sil.png")
-    plt.close()
-
-    #look at the relationship between predicted cluster centers and actual relative freq
-    all_dist = []
-    all_dist_weighed=[]
-    for index, row in final_df.iterrows():
-        predicted_centers = row['cluster_centers']
-        actual_centers = ast.literal_eval(row['abundance'])
-        predicted_centers.sort(reverse=True)
-        actual_centers.sort(reverse=True)
-        predict_len = len(predicted_centers)
-        actual_len = len(actual_centers)
-        if predict_len > actual_len:
-            pad_num = predict_len - actual_len
-            actual_centers.extend([0.0]*pad_num)
-        elif actual_len > predict_len:
-            pad_num = actual_len - predict_len
-            predicted_centers.extend([0.0]*pad_num)
-         
-
-        from scipy.spatial import distance
-        dist = 1-cosine(actual_centers, predicted_centers) 
-        all_dist.append(dist)
-
-  
- 
-    #distribution of distances from cluster centers
-    sns.set_style("whitegrid")
-    sns.distplot(x=all_dist, color='orange')
-    sns.distplot(x=all_dist_weighed, color='purple')
-    plt.xlabel("distance between GT freq and clsuter centers")
-    plt.title("similarities between GT freq and cluster centers")
-    plt.legend({'kmeans centers':'orange'})
-    plt.savefig("dist.png")
-    plt.close()
-
-
-    sns.set_style("whitegrid")
-    sns.scatterplot(x=all_dist, y=sil_score)
-    plt.ylabel("Sil Score")
-    plt.xlabel("Cosine similarity between predicted centers and actual frequencies")
-    plt.title("Relationship between Sil score and freq prediction accuracy")
-    plt.savefig("scatter.png")
-    plt.close()
-
-
-    #here we plot our "thresholds" against the % breakdown group
-    sns.set_style("whitegrid")
-    thresh_plot = [float(x) for x in final_df['threshold'].tolist()]
-    gt_plot = [str(x) for x in final_df['abundance'].tolist()]
-    for i,x in enumerate(gt_plot):
-        if '3.33' in x:
-            gt_plot[i]='33%'
-        if '25.0' in x:
-            gt_plot[i]='25%'
-        if '20.0, 20.0' in x:
-            gt_plot[i]='20%'
-    g=sns.boxplot(x=gt_plot, y=thresh_plot)
-    sns.swarmplot(x=gt_plot, y=thresh_plot, color='black')    
-    plt.ylabel("Threshold")
-    plt.xlabel("Ground Truth Abundance Group")
-    plt.title("Predicted thresholds vs. ground truth frequency values")
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig("thresholds.png")
-    plt.close()
-
-    correct = 0
-    incorrect = 0
-    gt_values = []
-    predicted = []
-    #print some summary stats
-    for index,row in final_df.iterrows():
-        #print(index,row)
-        if row['sil_opt_cluster'] == row['abundance_len']:
-            correct += 1
-        else:
-            incorrect += 1
-            gt_values.append(row['abundance'])
-            predicted.append(row['cluster_centers'])
-
    
-    #gives us the plot of actual num poplulations versus either
-    #(1) haplotypes max
-    #(2) snv max
-    #(3) cluster max
-    sns.set_style("whitegrid")
-    fig, ax = plt.subplots()
-    sns.swarmplot(x='abundance_len',y='max_halpotypes', data=final_df)
-    ax.axline((-1, 0), slope=1., color='red')
-    #ax.set_xlim(0, 5)
-    ax.set_ylim(0, 10) 
-    #plt.ylim(0, 5)
-    plt.xlabel("Number of Populations")
-    plt.ylabel("Max num haplotypes")
-    plt.title("Max haplotypes versus GT Populations") # You can comment this line out if you don't need title
-    plt.savefig("snv_max_real.png")
-    
 def number_gen(values, freq, muts):
     """
     values : list
@@ -1343,20 +1196,6 @@ def number_gen(values, freq, muts):
         return_coms.append(best_com)
     return(return_scores, return_coms)
 
-def call_consensus(filename, output_filename, threshold):
-    """
-    Given an input file, an ouput path, and a threshold, call consensus on a file.
-    """ 
-    cmd = "samtools mpileup -A -d 0 -Q 0 %s | ivar consensus -p %s -t %s" %(filename, output_filename, threshold) 
-    os.system(cmd) 
-   
-def call_pangolin(multifasta, output_filename):
-    """
-    Given a multi-fasta and output filename, align and output lineages.
-    """
-    cmd = "pangolin %s --outfile %s --alignment" %(multifasta, output_filename)
-    os.system(cmd)
- 
    
 def find_pure_file_mutations(pure_files, metadata, df):
     """
@@ -1522,11 +1361,6 @@ def variation_in_technical_replicates(metadata, df):
     plt.savefig("dist_var.png")
     plt.close()
 
-    #variance among technical replicate lower thresholds
-
-
-    #variances among technical replicates upper thresholds
-
     sys.exit(0)
 
 def single_file_mutation_graph(files, gt_dict, metadata, df):
@@ -1626,139 +1460,6 @@ def single_file_mutation_graph(files, gt_dict, metadata, df):
     plt.tight_layout() 
     plt.savefig("heat_10_90_gamma_alpha.png")
     plt.close()
-
-def call_variants(bam, basename, reference_filepath, variants_output_dir):
-    """
-    Parameters
-    ----------
-    bam : str
-        Full path to bam file.
-    basename : str
-        The name of the sample.
-    reference_filepath : str
-        Path to the reference .fasta file.
-    variants_output_dir : str
-        The directory in which to output the variants .tsv
-
-    Function takes in a bam file and uses command line to call ivar variants.
-    """
-    
-    print("calling ivar variants on", basename)
-
-    cmd = "samtools mpileup -aa -A -d 0 -B -Q 0 %s | ivar variants -p %s/variants_%s -q 20 -r %s" \
-            %(bam, variants_output_dir, basename, reference_filepath)
-    os.system(cmd)
-
-def call_getmasked(bam, basename, variants_output_dir, bed_filepath, primer_pair_filepath, \
-        output_dir):
-    """
-    Parameters
-    ----------
-    bam : str
-        Full path to bam file.
-    basename : str
-        The name of the sample.
-    variants_output_dir : str
-        The directory in which to output the variants .tsv
-    bed_filepath : str
-        The full path to the bed file.
-    primer_pair_filepath : str
-        The full path to the primer pair files.
-    output_dir : str
-        The directory to output the .txt file from ivar getmasked.
-    """
-    variants_filename = os.path.join(variants_output_dir, "variants_"+basename+".tsv")
-    if os.path.isfile(variants_filename):
-        pass
-    else:
-        return(1)
-
-    if not silent:
-        print("calling ivar getmasked on", basename)
-    
-    cmd = "ivar getmasked -i %s -b %s -f %s -p %s/masked_%s" %(variants_filename, bed_filepath, \
-            primer_pair_filepath, output_dir, basename)
-    os.system(cmd)
-
-def parse_mismatched_primers(basename, masked_output_dir, bam, output_dir, \
-        bed_filepath, primer_dict):
-    """
-    Parameters
-    ----------
-    basename : str
-        The name of the sample.
-    masked_output_dir : str
-        The directory where the masked .txt file is.
-    bam : str
-        Full filepath to the bam file.
-    output_dir : str
-        The output location of the dictionary with reads to be dropped.
-    bed_filepath : str
-        The location of the bed file with primer sites.
-
-    Function takes a masked file and iterates a bam to find reads that
-    should be dropped. Writes those reads to a json dictionary.
-    """
-    print("looking for primer mismatches") 
-    primers_mismatched = []
-
-    #open the masked file and read primers into a list
-    with open(os.path.join(masked_output_dir, "masked_"+basename+".txt"),'r') as tfile:
-        for line in tfile:
-            primers_mismatched.append(line.strip())
-   
-    #need a version of the primer name that doesn't include direction
-    primers_basename = [x[:-1] for x in primers_mismatched]
-
-    #open the bam
-    samfile = pysam.AlignmentFile(bam, "rb")
-    
-    primer_dict_save = {}
-    #then we open the bam file and iterate our mismatched primers
-    for primer_name, primer_full in zip(primers_basename, primers_mismatched):        
-        primer_0 = int(primer_dict[primer_name][0])
-        primer_1 = int(primer_dict[primer_name][1])+1
-        
-        #direction of the mismatched primer
-        direction_of_interest = primer_full[-1]
- 
-        #print(primer_name, direction_of_interest)
-        
-        #make sure we don't get a pair twice
-        seen_reads = []
-        dropped_reads = []
-        
-        #open the bam
-        samfile = pysam.AlignmentFile(bam, "rb")
-        
-        for pileupcolumn in samfile.pileup("NC_045512.2", start=primer_0, stop=primer_1):
-
-            for pileupread in pileupcolumn.pileups:
-           
-                found=False
-                reverse = pileupread.alignment.is_reverse
-
-                if reverse:
-                    primer_direction = 'R'
-                else:
-                    primer_direction = 'F'
-                #must match the direction we're masking
-                if primer_direction != direction_of_interest:
-                    continue
-                
-                #ignore if we're seen this read before
-                if pileupread.alignment.qname+"_"+primer_direction in seen_reads:
-                    continue
-                if pileupread.alignment.reference_start >= primer_0 and pileupread.alignment.reference_end <= primer_1:
-                    #print(pileupread.alignment.get_reference_positions())
-                    #sys.exit(0)
-                    seen_reads.append(pileupread.alignment.qname+"_"+primer_direction)
-                    dropped_reads.append(pileupread.alignment.qname+" %s"%primer_direction)
-                 
-        primer_dict_save[primer_0] = dropped_reads
-    
-    with open("../primer_drops/%s.json" %basename,"w") as jfile:
-        json.dump(primer_dict_save, jfile)
-        
+      
 if __name__ == "__main__":
     main()
