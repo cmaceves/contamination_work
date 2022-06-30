@@ -1,9 +1,13 @@
+"""
+Script takes in bam files and calculates per amplicon stats.
+"""
 import os
 import sys
 import ast
 import copy
 import json
 import pysam
+import itertools
 import warnings
 import argparse
 import statistics
@@ -11,17 +15,20 @@ import seaborn as sns
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.spatial.distance import cosine
-from joblib import Parallel, delayed
 from sklearn.cluster import KMeans
-from sklearn.cluster import KMeans, SpectralClustering
+from joblib import Parallel, delayed
+from scipy.spatial.distance import cosine
 from sklearn.metrics import silhouette_score
+
+
 from util import calculate_positional_depths
+from call_external_tools import call_variants, call_getmasked
 
 def warn(*args, **kwargs):
     pass
 
 warnings.warn = warn
+TEST=False
 
 def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
         noise_dict, pos_dict, primer_drops=None):
@@ -42,12 +49,15 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     returns the relative propotion of amplicon level haplotypes observed and positions in which mutations
     occur. 
     """
+    if TEST:
+        print("extracting amplicons for ", primer_0)
+
     #adjust for ends of possible reads
     primer_0 -= 1
     primer_1 += 1 
    
     #encoded nucs, 0 means match ref
-    encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5}
+    encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5, "D":6, "SC":-1, "M":0}
 
     #open the bam
     samfile = pysam.AlignmentFile(bam, "rb")
@@ -96,79 +106,92 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
 
             #read belongs to amplicon we're looking at
             if qualifies:
-                seen_reads.append(pileupread.alignment.qname+"_"+primer_direction)               
-
+                seen_reads.append(pileupread.alignment.qname+"_"+primer_direction)                 
+                ref_seq = list(pileupread.alignment.get_reference_sequence())
                 total_ref = pileupread.alignment.get_reference_positions(full_length=True)
                 total_query = list(pileupread.alignment.query_sequence)
                 total_qualities = list(pileupread.alignment.query_qualities)
+                alignment_object = pileupread.alignment.get_aligned_pairs(with_seq=True)
+                for count, tr in enumerate(total_ref):
+                    if tr is None:
+                        ref_seq.insert(count, None)
 
                 cigar = pileupread.alignment.cigartuples
                 cigar = [list(x) for x in cigar]
                 expand_cigar = []
-
                 for temp_cig in cigar:
                     expand_cigar.extend([temp_cig[0]]*temp_cig[1]) 
-
+                
                 for count, cig in enumerate(expand_cigar):
                     if cig == 2:
                         total_query.insert(count, None)
                         total_ref.insert(count, None)
                         total_qualities.insert(count, None)
+                        ref_seq.insert(count, None)
 
                 #used to track blocks of deletions and insertions
-                store_nuc=''
                 on_insertion=False
                 on_deletion=False
-
-                for pcount,(pos,nuc,qual,cigtype) in enumerate(zip(total_ref, total_query, total_qualities, expand_cigar)):
-                    if pos not in amp_indexes:
+                deletion = ''
+                insertion = ''
+            
+                for pcount,(pos,nuc,qual,cigtype, al, rs) in enumerate(zip(total_ref, total_query, total_qualities, \
+                        expand_cigar, alignment_object, ref_seq)):
+                    if pos is None and cigtype == 2:
+                        on_deletion = True
+                        deletion += al[2].upper()
                         continue
-
-                    #if we have an insertion we create a seperate encoding for it, and place it in
+                    elif pos not in amp_indexes:
+                        continue    
                     nuc = nuc.upper()
-                    
+
+                    #if we have an insertion we create a seperate encoding for it, and place it in    
                     if cigtype == 1:
                         on_insertion = True
-                        store_nuc += nuc.upper()
+                        insertion += nuc.upper()
                         continue
                     if cigtype == 4 or cigtype == 5:
                         continue
-
-                    if cigtype == 2:
-
-                    #we've hit the end of the insertion
-                    elif cigtype == 0 and on_insertion is True:
-                        new_value = max(encoded_nucs, key=encoded_nucs.get) 
-                        nuc = '+'+store_nuc
-                        encoded_nucs[nuc] = encoded_nucs[new_value]+1
-                        on_insertion = False
-                        pos = pcount - len(store_nuc)
-                        store_nuc =''
-   
+                    elif cigtype == 0:
+                        if on_insertion:
+                           pos = pos - len(insertion)
+                           nuc = '+'+insertion
+                           insertion=''
+                           ref = None
+                           on_insertion=False
+                        elif on_deletion:
+                            pos = pos - len(deletion)
+                            
+                            nuc = '-'+deletion
+                            deletion=''
+                            ref = None
+                            on_deletion=False
+                            
+                        else:
+                            nuc = nuc.upper()
+                            ref = rs.upper()
+                   
+                        if nuc not in encoded_nucs:
+                            new_value = max(encoded_nucs, key=encoded_nucs.get) 
+                            encoded_nucs[nuc] = encoded_nucs[new_value]+1
+                        
+                    #double check that it's on our amplicon 
                     if pos in amp_indexes:
+                        #this means it either it's a low level mutation or matches reference
                         if int(pos) in noise_dict:
                             noise = noise_dict[int(pos)]
-                            if nuc in noise:                           
+                            if nuc in noise or nuc == al[2]:                           
                                 loc = amp_indexes.index(pos)
                                 amp[loc] = 0.0
                                 freq[loc] = 0.0
                                 continue
-
                         loc = amp_indexes.index(pos)
                         amp[loc] = encoded_nucs[nuc]
                         quality[loc] += qual   
                         try:
                             #then we go find the overall freq
                             temp = pos_dict[str(pos)]['allele'][nuc]['count']/pos_dict[str(pos)]['total_depth']
-                            if temp > 0.97:
-                                loc = amp_indexes.index(pos)
-                                amp[loc] = 0.0
-                                freq[loc] =0.0
-                                quality[loc]=0.0
-                                continue
-                            else:
-                                freq[loc]=temp
-                                
+                            freq[loc]=temp
                         except:
                             pass
                             #print("failed to find " + str(pos) + " in " + bam + " pos dict")
@@ -184,33 +207,26 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     freq_matrix=np.array(freq_matrix)
     quality_matrix=np.array(quality_matrix)
 
-    #estimated num groups 
-    num_groups = []
-    final_tuples = []
     poi = []
-    #position of interest within this matrix
     relative_poi=[]
+    mutation_nt = []
+
+    #invert the dictionary key/value pairs
+    inv_map = {v: k for k, v in encoded_nucs.items()}
 
     #iterate by position
     for c, (pos_array, qual_array) in enumerate(zip(read_matrix.T, quality_matrix.T)):
         gt_pos = c+primer_0
-        if gt_pos != 23603:
-            continue
+
         #positions that match the reference
         match_ref = pos_array[pos_array==0]
         #positions that are soft clipped
         soft_clipped = pos_array[pos_array==-1]
         #positions that have mutations
         mutations = pos_array[pos_array>0]
-
-
         #if we don't have mutations here we don't care
         if len(mutations) == 0:
             continue
-        print("soft clipped:", len(soft_clipped))
-        print("match ref:", len(match_ref))
-        print("mutations:", len(mutations))
-
         
         #remover blank values from quality
         filter_qual = qual_array[qual_array>0]
@@ -218,24 +234,40 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
         avg_qual = np.average(filter_qual)
         if avg_qual < 20:
             continue        
+
         #depth doesn't include the softclipped
         total_depth = len(match_ref) + len(mutations)
+        if total_depth < 10:
+            continue
 
+        if TEST: 
+            print("pos", primer_0+c, \
+                "soft clipped", len(soft_clipped), \
+                "match ref", len(match_ref) , \
+                "mutations", len(mutations))
+        
+
+        #decode the mutations 
         values, counts = np.unique(mutations, return_counts=True)
         percent = [x/total_depth for x in counts]
+ 
         #remove low level mutations
         final = [z for z in zip(percent, values) if z[0] > 0.03]
+        
+
         if len(final) > 0:
             relative_poi.append(c)
             poi.append(c+primer_0)
-        num_groups.append(len(final))
-        final_tuples.append(final)
- 
+
     if read_matrix.ndim < 2:
         read_matrix = np.zeros((0,0))  
    
     max_groups = []
     group_counts=[]
+    groups = []
+    groups2 = []
+    mut_groups = []
+    poi_order=[]
     if len(relative_poi) > 0:
         filter_matrix = freq_matrix.T[relative_poi]
         read_matrix_filt = read_matrix.T[relative_poi]
@@ -245,36 +277,66 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
             print("error in matrix shape.")
             sys.exit(1)
 
-        #string rep
-        groups =[]
-        #float rep
-        groups2=[]
         #total used
         cc = 0
-        for count, (thing) in enumerate(filter_matrix.T):
-            #not covered or soft clipped, skip it, and later we'll place it in nearest group
-            if -1 in thing:
+        for count, (thing,thing2) in enumerate(zip(filter_matrix.T, read_matrix_filt.T)):
+            if -1 in thing2:
                 continue
+
+            #counts toward our total haplotype depth
             cc += 1
+
+            #if it only matches the reference we ignore it
+            muts_contained = list(np.unique(thing2))
+            if len(muts_contained) == 1 and muts_contained[0] == 0:
+                continue
+
+            decoded_mutations = [inv_map[a] for a in thing2]
             thing = [str(x) for x in list(thing)]
             stringify = '-'.join(thing)
             thing = [float(x) for x in thing]
             if stringify not in groups:
                 groups.append(stringify)
                 groups2.append(list(thing))
+                mut_groups.append(decoded_mutations)
                 group_counts.append(1)
             else:
                 loc = groups.index(stringify)
                 group_counts[int(loc)] += 1
-                 
-    group_percents = [x/cc for x in group_counts]     
     
-    for i,(mg, gc) in enumerate(zip(max_groups, group_percents)):
-        if np.count_nonzero(mg) == 0:
-            max_groups.remove(mg)
-            group_percents.remove(gc)
+    
+    group_percents = [x/cc for x in group_counts]     
+     
+    #remove low occuring groups
+    positions_to_remove = []
+    for i, perc in enumerate(group_percents):
+        if perc < 0.03:
+            positions_to_remove.append(i)
+            del group_percents[i]
+            del groups[i]
+            del groups2[i]
+            del mut_groups[i]
 
-    return(poi, group_percents, found_amps)
+    group_percents = [a for i,a in enumerate(group_percents) if i not in positions_to_remove]
+    groups = [a for i,a in enumerate(groups) if i not in positions_to_remove]
+    groups2 = [a for i,a in enumerate(groups2) if i not in positions_to_remove]
+    mut_groups = [a for i,a in enumerate(mut_groups) if i not in positions_to_remove]
+
+    
+
+    if TEST:
+        """
+        Groups2 represents the overall postion depth.
+        """
+        print("poi", poi, "\n",\
+                "haplotype percents", group_percents, "\n", \
+                "mutation groups", mut_groups, "\n", \
+                "groups2", groups2
+                )
+        for p in poi:
+            print(p, pos_dict[str(p)])
+
+    return(poi, group_percents, found_amps, groups2, mut_groups)
 
 
 def get_primers(primer_file):
@@ -302,7 +364,7 @@ def get_primers(primer_file):
         #remove the forward, reverse aspect of the primer name
         pn = pl[3][:-1]
         primer_names.append(pn)
-    
+     
     unique_pn = list(np.unique(primer_names))
     primer_dict = {key:[0.0]*2 for key in unique_pn}
     primer_dict_inner = {key:[0.0]*2 for key in unique_pn}
@@ -338,9 +400,25 @@ def get_primers(primer_file):
     return(primer_dict, primer_dict_inner)
 
 
-def parallel(all_bams):
-    results = Parallel(n_jobs=3)(delayed(process)(bam) for bam in all_bams)
-    
+def parallel(primer_dict, bam, total_pos_depths, noise_dict, primer_dict_inner, \
+        basename, n_jobs):
+    """
+    Function takes in primer dict and bam and parallel processes each file to 
+    extract amplicon information.
+    """
+    results = Parallel(n_jobs=n_jobs)(delayed(extract_amp_parallel_wrapper)(k, v, bam, \
+            total_pos_depths, noise_dict, \
+            primer_dict_inner) for k,v in primer_dict.items())
+    file_level_dict = {}
+    for r in results:
+        file_level_dict[r[0]] = r[1]
+
+    if TEST:
+        print(file_level_dict)
+ 
+    with open("../json/%s.json" %basename, "w") as jfile:
+        json.dump(file_level_dict, jfile)
+
 def parse_snv_output(csv_filename):
     """
     Gets filenames and thresholds from the .csv file output.
@@ -362,20 +440,16 @@ def parse_snv_output(csv_filename):
 
 def main():
     #list all json files
-    #all_json = [x for x in os.listdir("../spike_in") if x.endswith('.bam')]
-    #all_json = ["file_124_sorted.calmd.bam", "file_125_sorted.calmd.bam", "file_127_sorted.calmd.bam"]
-    #all_json = ["file_124_sorted.calmd.bam"]
-    #all_json = [os.path.join("../spike_in",x) for x in all_json]
+    all_json = [x for x in os.listdir("../spike_in") if x.endswith('.bam')]
+    all_json = [os.path.join("../spike_in",x) for x in all_json]
     
     file_folder = "../json"
 
-    #parallel(all_json)
+    #for filename in all_json:
+    #    process(filename)
     #sys.exit(0)
-
-    #this line is used for testing
-    process("/home/chrissy/Desktop/retrimmed_bam/file_124.sorted.final.bam")
+    process("/home/chrissy/Desktop/spike_in/file_124_sorted.calmd.bam")
     sys.exit(0)
-    
     #creates the .csv file with thresholds and other info 
     group_files_analysis(file_folder)
     sys.exit(0)
@@ -738,9 +812,7 @@ def process(bam):
     bed_filepath = "../sarscov2_v2_primers.bed"
     primer_pair_filepath = "../primer_pairs.tsv"
     masked_output_dir = "../masked"
-    primer_drop_dir = "../primer_drops"
     
-    """
     #this block calls get masked and variants
     variants_check = os.path.join(variants_output_dir, "variants_"+basename+".tsv")
     if not os.path.isfile(variants_check):
@@ -752,20 +824,21 @@ def process(bam):
         #call getmasked to get the primer mismatches
         call_getmasked(bam, basename, variants_output_dir, bed_filepath, \
             primer_pair_filepath, masked_output_dir)
-    """
+    
+    sys.exit(0)
     primer_dict, primer_dict_inner  = get_primers(primer_file)
       
     if not os.path.isfile("../pos_depths/%s_pos_depths.json" %basename): 
-        try:
-            total_pos_depths = calculate_positional_depths(bam)
-            with open("../pos_depths/%s_pos_depths.json" %basename, "w") as jfile:
-                json.dump(total_pos_depths, jfile) 
-        except:
-            return(1)
+        #try:
+        total_pos_depths = calculate_positional_depths(bam)
+        with open("../pos_depths/%s_pos_depths.json" %basename, "w") as jfile:
+            json.dump(total_pos_depths, jfile) 
+        #except:
+        #    return(1)
     else:
         with open("../pos_depths/%s_pos_depths.json" %basename, "r") as jfile:
             total_pos_depths = json.load(jfile)
-    
+      
     encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5}
     noise_dict = {}
     print_list = []
@@ -777,56 +850,76 @@ def process(bam):
         noise_dict[int(k)] = []
         total_depth = v['total_depth']
         alleles = v['allele']
-        ref = max(v['ref'], key=v['ref'].get)
-        noise_dict[int(k)].append(ref)
+        #if we have a reference value
+        if bool(v['ref']):
+            ref = max(v['ref'], key=v['ref'].get)
+            noise_dict[int(k)].append(ref)
         for nt, count in alleles.items():
             if count['count']/total_depth < 0.03:
                 noise_dict[int(k)].append(nt)
      
     #gives us matches of primers by name
     primer_dict, primer_dict_inner  = get_primers(primer_file)
- 
+    
+    n_jobs = 20
+
+    #TEST LINES
+    if TEST:
+        test_dict = {}
+        for k,v in primer_dict.items():
+            if int(v[0]) == 23601:
+                test_dict[k] = v
+        primer_dict = test_dict
+        n_jobs = 1 
+
     p_0=[]
     p_1=[]
     p_0_inner=[]
     p_1_inner=[] 
     count = 0
     file_level_dict = {}
-   
-    #this would be a good place to parallelize
-    for k,v in primer_dict.items():   
-        primer_0 = int(v[0])
-        primer_1 = int(v[1])
+    parallel(primer_dict, bam, total_pos_depths, noise_dict, primer_dict_inner, \
+            basename, n_jobs)  
 
-        primer_0_inner = int(primer_dict_inner[k][0])
-        primer_1_inner = int(primer_dict_inner[k][1])
-     
-        #TEST LINE
-        if primer_0 != 23514:
-            continue
- 
-        #we didn't successfully find a primer pair
-        if primer_0 == 0.0 or primer_1 == 0.0 or primer_0_inner == 0 or primer_1_inner ==0:
-            continue    
-        p_0.append(primer_0)
-        p_1.append(primer_1)
-        p_0_inner.append(primer_0_inner)
-        p_1_inner.append(primer_1_inner)
-        poi, groups_percents, found_amps = extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, noise_dict, total_pos_depths)
+def extract_amp_parallel_wrapper(k, v, bam, total_pos_depths, noise_dict,\
+        primer_dict_inner):
+    """
+    Function takes in the primers and a bam file and calls the extract amplicons 
+    function to recover amplicon level
+    (1) haplotypes
+    (2) haplotype frequencies
+    (3) positions of mutations
+    (4) mutation frequencies
+    (5) the number of reads per amplicon
+    """
 
-        amplicon_level_dict = { "poi":poi, \
-            "haplotype_percents": groups_percents, "found_amps": int(found_amps), \
-            }
-        file_level_dict[primer_0] = amplicon_level_dict
+    primer_0 = int(v[0])
+    primer_1 = int(v[1])
+
+    primer_0_inner = int(primer_dict_inner[k][0])
+    primer_1_inner = int(primer_dict_inner[k][1])
     
-    with open("../json_primers/primers_%s.json" %basename, "w") as jfile:
-        json.dump(file_level_dict, jfile)
-    return(0)
+    #we didn't successfully find a primer pair
+    if primer_0 == 0.0 or primer_1 == 0.0 or primer_0_inner == 0 or primer_1_inner == 0:
+        return(primer_0, {})
+    poi, groups_percents, found_amps, freqs, mut_groups = extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, noise_dict, total_pos_depths)
+
+    amplicon_level_dict = { "poi":poi, \
+        "haplotype_percents": groups_percents, "found_amps": int(found_amps), \
+        'mut_groups':mut_groups, 'poi_freq': freqs}
+    
+    return(primer_0, amplicon_level_dict)
 
 def group_files_analysis(file_folder):  
     """
+    Parameters
+    ----------
     file_folder : str
         Location where the .json files containing amplicon level mutations are found.
+
+    Function takes in a directory, and iterates the directory processing all json files.
+    Each json file contains amplicon level information that is used to cluster within
+    each file.
     """
     print("Begining group file analysis")
 
@@ -854,232 +947,139 @@ def group_files_analysis(file_folder):
 
     #iterate through every output result
     for file_output in json_filenames:
-        
+        #can't open what doesn't exist --__(..)__--
         if not os.path.isfile(file_output):
             continue
         if file_output not in seen:
             continue
+
         basename = file_output.split(".")[0]
         
-        #load total positional depths
+        #all the haplotype frequencies in one large list
+        total_haplotype_freq = []
+        total_mutation_freq = []
+        total_positions = []
+
         with open(file_output, 'r') as jfile:
             data = json.load(jfile)
             keys = list(data.keys())
-            mng_all = []
-            poi_all = []
-            cluster_data=[]
-            store_max_freq = []
-            muts_all=[]
-            group_muts=[] #max number of groups
-            other_data=[]
-            halotypes=[]
-            mut_freq_dict = {}
-            d_data = []
-            freq_groups = []
-            collapsed_read_max = 0
+
 
             #key is primer, value is percenets, mutations, haplotypes
             for k,v in data.items():
-                 
-                if int(k) != 23514:
+                #if dictionary is empty keep going
+                if len(v) == 0:
                     continue
-                print(file_folder, v)
-                sys.exit(0)
+
                 total_amp_depth = v['found_amps']
                  
                 #related to the halotypes
                 if total_amp_depth < 10:
                     continue
-                percents = v['groups_percents']
-                mng = v['max_groups']
-                muts = v['poi']
 
-
-                #print(file_output, mng, muts, percents)
-                #this amplicon contained no useful info about variance
-                if len(mng) ==0:
+                haplotype_percents = v['haplotype_percents']
+                positions = v['poi']
+                position_freq = v['poi_freq']
+                mutations_first = v['mut_groups']
+                
+                #keep going if we have no mutations on this amplicon
+                if len(haplotype_percents) == 0:
                     continue
                 
-                #not in coding region
-                for thing1, thing2 in zip(mng, muts):
-                    if thing2 < 265 or thing2 > 29675:
-                        mng.remove(thing1)
-                        muts.remove(thing2)
-       
-                keep_halotype_index = [i for i,c in enumerate(percents) if c > 0.03]
-                mng = [x for i,x in enumerate(mng) if i in \
-                    keep_halotype_index and np.count_nonzero(x) != 0]
+                #TEST LINES                
+                if int(k) == 23601:
+                    print('primer', k,\
+                            'haplotype percents', haplotype_percents, \
+                            'position freq', position_freq, \
+                            'mutations', mutations, \
+                            'positions', positions)
                 
-                if len(mng) == 0:
+                """
+                positions_to_remove = [] 
+                for i, a  in enumerate(position_freq):
+                    if a > 0.97 or a < 0.03:
+                       positions_to_remove.append(i)
+                
+                position_freq = [a for i,a in enumerate(position_freq) \
+                        if i not in positions_to_remove]
+                positions = [a for i,a in enumerate(positions) \
+                        if i not in positions_to_remove]
+                
+                mutations = []
+                for mut in mutations_first:
+                    mut = [a for i,a in enumerate(mut) if i not in positions_to_remove]
+                    mutations.append(mut)
+                """
+                mutations = mutations_first
+                positions_to_remove = []
+
+                #let's get rid of match haplotypes, low freq haplotypes
+                for i, (hp, mg) in enumerate(zip(haplotype_percents, mutations)):
+                    #figure out if this "haplotype" is somewhow all muts
+                    uniq_muts = np.unique(mg)
+                    if len(uniq_muts) == 1 and uniq_muts[0] == 'M':
+                        positions_to_remove.append(i)
+                        continue
+                    if hp < 0.03 or hp > 0.97:
+                        positions_to_remove.append(i)
+               
+                mutations = [a for i,a in enumerate(mutations) \
+                        if i not in positions_to_remove]
+                haplotype_percents = [a for i,a in enumerate(haplotype_percents) \
+                        if i not in positions_to_remove]
+
+                if len(haplotype_percents) == 0:
                     continue
-                for m1 in np.array(mng).T:
-                    halotypes.append(len(m1))
-                    num_halo = len(m1)
-                    store_max_freq.append(mng)
-            
-                #print(file_output, percents, mng)
-                d_data.extend([i for i in percents if i > 0.03])
-                #print(mng)
-                #here we collapse in this way
-                # (1) frequency within reads
-                # (2) frequency between reads
-                #store reads by freq profile
-                stored_read_profiles = []
-                for ab in mng:
-                    collapse=[]
-                    nonzero = [x for x in ab if x > 0]
-                    if len(nonzero) == 0:
-                        continue
-                    for nz in nonzero:
-                        found=False
-                        for c in collapse:
-                            if abs(c-nz) < 0.01:
-                                found=True
-                                break
-                        if not found:
-                            collapse.append(nz)
-                    stored_read_profiles.extend(collapse)
-                #print(stored_read_profiles)
-                collapsed_read_profiles=[]
-                for item in stored_read_profiles:
-                    found=False
-                    for item2 in collapsed_read_profiles:
-                        if abs(item-item2) < 0.01:
-                            found=True
-                            break
-                    if not found:
-                        collapsed_read_profiles.append(item)
-               
-                if len(collapsed_read_profiles) > collapsed_read_max:
-                    collapsed_read_max = len(collapsed_read_profiles) 
-                    prof_of_choice = collapsed_read_profiles 
+
+                total_haplotype_freq.extend(haplotype_percents)
+                total_mutation_freq.extend(position_freq)   
+                total_positions.extend(positions)
                 
-                 
-                #test code for me only
-                #used to look at potential halotype clustering
-               
-                #if file_output == "file_16.json":
+                #try and see if this amplicon is messed up
+                binding_correct = test_amplicon(k, haplotype_percents, position_freq, mutations, positions)
+                if binding_correct is False:
+                    print(k, haplotype_percents, position_freq, binding_correct)
+                
+            
+                #TEST LINES
                 """
-                if num_halo == 4:
-                    print('in it', file_output)
-                    #print(num_halo)
-                    print('percents ', percents)
-                    for ab in mng:
-                        print([round(x,2) for x in ab])
-                    #print(np.array(mng).shape, file_output, k)
-                    print('muts ', muts)
-                    #sys.exit(0)      
+                if int(k) == 23514:
+                    print('primer', k,\
+                            'haplotype percents', haplotype_percents, \
+                            'position freq', position_freq, \
+                            'mutations', mutations, \
+                            'positions', positions)
                 """
-                muts_all.append(muts)
-                mng_all.append(mng)
-            
-            #creat a dict that store the freq associated with each mut
-            for mut, mng in zip(muts_all, mng_all):
-                mng = np.array(mng).T.tolist()
-                for c, (mut_temp, freq) in enumerate(zip(mut, mng)):
-                    freq = [x for x in freq if x > 0]
-                    mut_freq_dict[mut_temp] = freq
 
-            freq_dict = {}
-            for k,v in mut_freq_dict.items():        
-                for freq in v:
-                    if freq > 0.97 or freq < 0.03:
-                        continue
-                    found=False
-                    #search against what we already have
-                    for k2,v2 in freq_dict.items():
-                        if abs(k2-freq) < 0.01:
-                            found=True
-                            if k not in freq_dict[k2]:
-                                freq_dict[k2].append(k)
-                            break
-                    if found is False:
-                        freq_dict[freq] = [k]
-            pooled_muts = []
-
-            #pooling all mutation values
-            for k,v in freq_dict.items():
-                pooled_muts.extend(v)
-            unique, counts = np.unique(pooled_muts, return_counts=True)
-            
-            flag_key=[]
-            x =[]
-            y = []
-            mut_tag = []
-            for k,v in freq_dict.items():
-                x.append(k)
-                y.append(len(v))
-                mut_tag.append(v)
-                for f in v:
-                    loc = list(unique).index(f)
-                    if counts[loc] > 1:
-                        flag_key.append(k)
-            unique_freq = []
-            for k,v in freq_dict.items():
-                if k not in flag_key:
-                    for f in v:
-                        #if f > genes[0] and f < genes[1]:
-                        unique_freq.append(k)
-                        break
-            
-            #print(file_output)
-            unique_freq.sort()             
-            zipped = zip(x,y,mut_tag)
-            zipped = sorted(zipped, key = lambda x:x[1])
-            all_mng_data.append(zipped)
-            try:
-                x,y,mut_tag = zip(*zipped)
-            except:
-                print("fail ", file_output)
-                #os.system("rm %s" %file_output)
-                continue
-            c_data = []
-            all_muts_count = sum(y)
-            for x1,y1,m1, in zip(x,y,mut_tag):
-                c_data.extend([x1])
-                #print(x1,y1,m1)
-                pass
-            
-            #print(file_output, " c ", c_data)
-            #print(file_output, " d ", d_data)
-            #returns scores/targets 
-            #combo_move = number_gen(possible_range, list(x), list(mut_tag))
-            
+            sys.exit(0)
+             
             cluster_center_sums = []
             all_cluster_centers = []
-            all_inertia = []
-            cluster_sums=[]
             cluster_centers=[]
             all_sil=[]
-            x_reshape = np.array(c_data).reshape(-1,1)
-            d_reshape = np.array(d_data).reshape(-1,1)
+            
+            total_haplotype_reshape = np.array(total_haplotype_freq).reshape(-1,1)
+            total_mutation_reshape = np.array(total_mutation_freq).reshape(-1,1)
+            
             lowest_value_highest_cluster = []
             highest_value_highest_cluster = [] 
-            #print(d_data, c_data)
-            if len(x_reshape) == 1:
-                possible_explanations = [1]
-            elif len(x_reshape) <= 6:
-                possible_explanations = list(range(max(halotypes),len(x_reshape)))       
-            else:
-                possible_explanations = list(range(max(halotypes),6)) 
-             
-            #print(possible_explanations, x, mut_tag) 
-            for num in possible_explanations: 
-                combo_move = number_gen([num], list(x), list(mut_tag))
-                initial = np.array([float(x) for x in combo_move[1][0]]).reshape(-1,1)
+            
+            possible_explanations = list(range(2,6)) 
+            
+            for num in possible_explanations:           
                 #kmeans clustering
-                init_cluster = np.array(x[-num:]).reshape(-1,1)
-                kmeans = KMeans(n_clusters=num, init=initial, random_state=10).fit(d_reshape)
+                kmeans = KMeans(n_clusters=num, random_state=10).fit(total_haplotype_reshape)
                 centers = kmeans.cluster_centers_            
+                #print(centers, silhouette_score(total_mutation_reshape, kmeans.labels_))
+                #print(kmeans.labels_)
                 flat_list = [item for sublist in centers for item in sublist]
-                
                 all_cluster_centers.append(flat_list)                    
-              
+                
                 #here we find the smallest value in the "highest freq" cluster
                 largest_cluster_center = max(flat_list)
                 label_largest_cluster = flat_list.index(largest_cluster_center)
                 smallest_value_largest_cluster = \
-                    [v for v,l in zip(d_data, kmeans.labels_) if l == label_largest_cluster]
+                    [v for v,l in zip(total_haplotype_freq, kmeans.labels_) if l == label_largest_cluster]
                 
                 lowest_value_highest_cluster.append(min(smallest_value_largest_cluster))
                 
@@ -1088,10 +1088,10 @@ def group_files_analysis(file_folder):
                 highest_value_highest_cluster.append(max(smallest_value_largest_cluster))
                  
                 cluster_center_sums.append(sum(flat_list))
-                try: 
-                    all_sil.append(silhouette_score(d_reshape, kmeans.labels_))
-                except:
-                    all_sil.append(0)
+                
+                
+                all_sil.append(silhouette_score(total_haplotype_reshape, kmeans.labels_))
+                
                     
             #now we have negative files in place
             if len(all_sil) != 0:        
@@ -1100,13 +1100,12 @@ def group_files_analysis(file_folder):
                 best_fit = min(cluster_center_sums, key=lambda cluster_center_sums : abs(cluster_center_sums -1))
                 loc=cluster_center_sums.index(best_fit)
                 cluster_centers=all_cluster_centers[loc]
-                cluster_sums=cluster_center_sums[loc]
                 cluster_opt = possible_explanations[loc]
                 possible_threshold_low = lowest_value_highest_cluster[loc]
                 possible_threshold_high = highest_value_highest_cluster[loc]
                 act_sil = all_sil[loc]
-                mut_certainty = sum(y)
-               
+                
+                #print(possible_threshold_high, possible_threshold_low)
                 cluster_centers.sort(reverse=True)
                 try:
                     possible_threshold_amb = possible_threshold_high+0.015
@@ -1114,41 +1113,19 @@ def group_files_analysis(file_folder):
                 except:
                     possible_threshold=0
                     possible_threshold_amb=0
-                #okay, lets ask what thresholds we could set k means method
-                #no threshold returned if we think we have 1 thing
-                """
-                if cluster_opt == 1:
-                    possible_threshold=0
-                    possible_threshold_amb=0
-                #if the largest thing is less than 50% we ignore it
-                elif cluster_centers[0] < 0.5:
-                    possible_threshold_amb=0
-                    possible_threshold=0
-                elif max(halotypes) > 3:
-                    possible_threshold_amb=0
-                    possible_threshold =0
-                elif cluster_opt == 2 or cluster_opt == 3:
-                    if abs(cluster_centers[0]-cluster_centers[1]) < 0.15:
-                        possible_threshold_amb=0
-                        possible_threshold=0
-                """
-                max_halotype = max(halotypes)
+                
                 
                 temp_dict[file_output.replace(".json","").replace(file_folder+'/',"")]= {
-                    'max_halpotypes':max_halotype,\
                      'cluster_centers': cluster_centers,\
                      'sil_opt_cluster':cluster_opt,\
                      'sil':act_sil,\
-                     'unique_mut':str(zipped), 'mut_certainty':mut_certainty,\
                      'threshold':possible_threshold, "threshold_amb":possible_threshold_amb}
                 
             else: 
                 temp_dict[file_output.replace(".json","").replace(file_folder+"/","")]= {
-                    'max_halpotypes':0,\
                     'cluster_centers': 0,\
                     'sil_opt_cluster':0,\
                     'sil':0,\
-                    'unique_mut':0, 'mut_certainty':mut_certainty,\
                     'threshold':0, 'threshold_amb':0}
         
     df_outcome = pd.DataFrame(temp_dict).T
@@ -1156,47 +1133,37 @@ def group_files_analysis(file_folder):
     final_df = df_outcome.merge(meta_df, on='index', how='left')
     final_df.to_csv("snv_output.csv")
    
-def number_gen(values, freq, muts):
+def test_amplicon(primer_0, haplotype_percents, position_freq, mutations, pos):
     """
-    values : list
-        List of a range of  number of frequencies we're looking for.
-    freq : list
-        possible frequencies
-    muts : list
-        list of all mutations
-    """ 
-    import itertools
-    return_scores = []
-    return_coms = []
-    for target in values:
-        
-        all_scores = []
-        all_coms = []
-        combos = itertools.combinations(freq, target)
-        mut_length = len([item for sublist in muts for item in sublist])
-        for com in combos:    
-            mut_locs = [freq.index(i) for i in list(com)]\
-            #gather all muts for these freq
-            mut_counts = [muts[i] for i in mut_locs]
-            mut_counts = len([item for sublist in mut_counts for item in sublist])
-            #add up all frequnecies
-            summation = sum(com)
-            #calculate closeness to 1
-            dist = 1-abs(summation-1)
-            #normalize and sum average mutations accounted for
-            per_muts = (mut_counts/mut_length)/len(com)
-            #weight these two things equally
-            scores = (dist+per_muts)/2  
-            all_scores.append(scores)
-            all_coms.append(list(com))
-        best = max(all_scores)
-        loc = all_scores.index(best)
-        best_com = all_coms[loc]
-        return_scores.append(best)
-        return_coms.append(best_com)
-    return(return_scores, return_coms)
+    Parameters
+    ----------
+    primer_0 : int
+    haplotype_percents : list
+    positions_freq : list 
+    mutations : list
 
-   
+    Returns
+    -------
+    correct : boolean
+        Describes whether or not the primer binding is correct. 
+
+    Compare the haplotype frequencies to the frequencies of the individual mutations
+    that occur, and if they differ siginficantly return False.
+    """
+    correct=True
+    #we iterate through each haplotype frequency
+    for hp,mut,pf in zip(haplotype_percents, mutations, position_freq):
+        for f in pf:
+            #uninformative frequencies
+            if f == 0 or f == -1 or f > 0.97:
+                continue
+            if abs(f-hp) > 0.20:
+                correct=False
+        if correct is False:
+            #print(primer_0, haplotype_percents, position_freq, mutations,pos)
+            return(correct)
+    return(True)
+
 def find_pure_file_mutations(pure_files, metadata, df):
     """
     Given a list of the pure filenames return mutations found.
@@ -1460,6 +1427,6 @@ def single_file_mutation_graph(files, gt_dict, metadata, df):
     plt.tight_layout() 
     plt.savefig("heat_10_90_gamma_alpha.png")
     plt.close()
-      
+  
 if __name__ == "__main__":
     main()

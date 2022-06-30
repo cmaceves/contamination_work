@@ -32,6 +32,7 @@ def call_variants(bam, basename, reference_filepath, variants_output_dir):
     cmd = "samtools mpileup -aa -A -d 0 -B -Q 0 %s | ivar variants -p %s/variants_%s -q 20 -r %s" \
             %(bam, variants_output_dir, basename, reference_filepath)
     os.system(cmd)
+
 def call_getmasked(bam, basename, variants_output_dir, bed_filepath, primer_pair_filepath, \
         output_dir):
     """
