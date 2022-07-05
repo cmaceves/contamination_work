@@ -22,13 +22,14 @@ from sklearn.metrics import silhouette_score
 
 
 from util import calculate_positional_depths
-from call_external_tools import call_variants, call_getmasked
+from call_external_tools import call_variants, call_getmasked, retrim_bam_files
 
 def warn(*args, **kwargs):
     pass
 
 warnings.warn = warn
 TEST=False
+PRIMER_FILE = "/home/chrissy/Desktop/sarscov2_v2_primers.bed"
 
 def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
         noise_dict, pos_dict, primer_drops=None):
@@ -280,9 +281,9 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
         #total used
         cc = 0
         for count, (thing,thing2) in enumerate(zip(filter_matrix.T, read_matrix_filt.T)):
-            if -1 in thing2:
+            if -1 in thing2 or -1 in thing:
                 continue
-
+            
             #counts toward our total haplotype depth
             cc += 1
 
@@ -310,7 +311,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     #remove low occuring groups
     positions_to_remove = []
     for i, perc in enumerate(group_percents):
-        if perc < 0.03:
+        if perc < 0.03 or perc > 0.97:
             positions_to_remove.append(i)
             del group_percents[i]
             del groups[i]
@@ -322,8 +323,11 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     groups2 = [a for i,a in enumerate(groups2) if i not in positions_to_remove]
     mut_groups = [a for i,a in enumerate(mut_groups) if i not in positions_to_remove]
 
-    
+    #if we've managed to eliminate all haplotypes, remove poi too
+    if len(group_percents) == 0:
+        poi = []
 
+    
     if TEST:
         """
         Groups2 represents the overall postion depth.
@@ -335,7 +339,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
                 )
         for p in poi:
             print(p, pos_dict[str(p)])
-
+        
     return(poi, group_percents, found_amps, groups2, mut_groups)
 
 
@@ -390,12 +394,6 @@ def get_primers(primer_file):
             primer_dict[pn][1] = val
             primer_dict_inner[pn][1] = pl[1]
             primer_pairs[pn][1] = pl[-1]
-    """
-    del primer_pairs['covid19genome_0-200_s0_M1']
-    del primer_pairs['covid19genome_0-200_s0_M2']
-    df = pd.DataFrame(primer_pairs)
-    df.T.to_csv("primer_pairs.tsv", sep='\t', header=False, index=False)
-    """
 
     return(primer_dict, primer_dict_inner)
 
@@ -441,17 +439,32 @@ def parse_snv_output(csv_filename):
 def main():
     #list all json files
     all_json = [x for x in os.listdir("../spike_in") if x.endswith('.bam')]
-    all_json = [os.path.join("../spike_in",x) for x in all_json]
+    all_json = [os.path.join("/home/chrissy/Desktop/spike_in",x) for x in all_json]
     
     file_folder = "../json"
+    
+    output_dir = "/home/chrissy/Desktop/retrimmed_bam"
+    ref_seq = "/home/chrissy/Desktop/sequence.fasta"
+    primer_bed = "/home/chrissy/Desktop/sarscov2_v2_primers.bed"
 
-    #for filename in all_json:
-    #    process(filename)
-    #sys.exit(0)
-    process("/home/chrissy/Desktop/spike_in/file_124_sorted.calmd.bam")
+    for filename in all_json:
+        if filename != "/home/chrissy/Desktop/spike_in/file_128_sorted.calmd.bam":
+            continue
+        basename = filename.split("/")[-1].split("_s")[0]
+        if os.path.isfile(os.path.join(output_dir, basename+".final.bam")):
+            continue
+        final_bam = retrim_bam_files(filename, basename, output_dir, ref_seq, primer_bed)
+   
+    all_retrimmed = [x for x in os.listdir("../retrimmed_bam") if x.endswith(".bam")]
+    all_retrimmed = [os.path.join("/home/chrissy/Desktop/retrimmed_bam", x) for x in all_retrimmed]
+    
+    for ar in all_retrimmed:
+        process(ar)
     sys.exit(0)
-    #creates the .csv file with thresholds and other info 
-    group_files_analysis(file_folder)
+
+    #creates the .csv file with thresholds and other info
+    primer_dict, primer_dict_inner  = get_primers(PRIMER_FILE) 
+    group_files_analysis(file_folder, primer_dict)
     sys.exit(0)
 
     #sys.exit(0)
@@ -825,7 +838,7 @@ def process(bam):
         call_getmasked(bam, basename, variants_output_dir, bed_filepath, \
             primer_pair_filepath, masked_output_dir)
     
-    sys.exit(0)
+    
     primer_dict, primer_dict_inner  = get_primers(primer_file)
       
     if not os.path.isfile("../pos_depths/%s_pos_depths.json" %basename): 
@@ -861,13 +874,13 @@ def process(bam):
     #gives us matches of primers by name
     primer_dict, primer_dict_inner  = get_primers(primer_file)
     
-    n_jobs = 20
+    n_jobs = 35
 
     #TEST LINES
     if TEST:
         test_dict = {}
         for k,v in primer_dict.items():
-            if int(v[0]) == 23601:
+            if int(v[0]) == 23514:
                 test_dict[k] = v
         primer_dict = test_dict
         n_jobs = 1 
@@ -910,17 +923,21 @@ def extract_amp_parallel_wrapper(k, v, bam, total_pos_depths, noise_dict,\
     
     return(primer_0, amplicon_level_dict)
 
-def group_files_analysis(file_folder):  
+def group_files_analysis(file_folder, primer_dict, foi=None):  
     """
     Parameters
     ----------
     file_folder : str
         Location where the .json files containing amplicon level mutations are found.
 
+    primer_dict : dict
+        Dictionary relating primers names to their start position.
+
     Function takes in a directory, and iterates the directory processing all json files.
     Each json file contains amplicon level information that is used to cluster within
     each file.
     """
+
     print("Begining group file analysis")
 
     #load metadata
@@ -937,13 +954,10 @@ def group_files_analysis(file_folder):
     all_files = [x for x in os.listdir("../spike_in") if x.endswith('sorted.calmd.bam')]
     json_filenames = [os.path.join(file_folder,(x.split('.')[0]+'.json').replace("_sorted","")) for x in all_files]
     
-    #used the control what files we look at
-    seen = [os.path.join(file_folder,"file_124.json")]
-    #seen=[]
+    #where we store all results prior to writing to .csv 
     temp_dict = {}
-   
-    variant_read_covariance = []
-    all_mng_data = []
+
+    seen = [os.path.join(file_folder,"file_124.json")]
 
     #iterate through every output result
     for file_output in json_filenames:
@@ -952,18 +966,18 @@ def group_files_analysis(file_folder):
             continue
         if file_output not in seen:
             continue
-
-        basename = file_output.split(".")[0]
+        
+        basename = file_output.split("/")[-1].replace(".json","")
         
         #all the haplotype frequencies in one large list
         total_haplotype_freq = []
         total_mutation_freq = []
         total_positions = []
+        improper_primers = []
 
         with open(file_output, 'r') as jfile:
             data = json.load(jfile)
             keys = list(data.keys())
-
 
             #key is primer, value is percenets, mutations, haplotypes
             for k,v in data.items():
@@ -987,19 +1001,22 @@ def group_files_analysis(file_folder):
                     continue
                 
                 #TEST LINES                
+                """
                 if int(k) == 23601:
                     print('primer', k,\
                             'haplotype percents', haplotype_percents, \
                             'position freq', position_freq, \
                             'mutations', mutations, \
                             'positions', positions)
+                """
                 
                 """
                 positions_to_remove = [] 
                 for i, a  in enumerate(position_freq):
-                    if a > 0.97 or a < 0.03:
-                       positions_to_remove.append(i)
-                
+                    if len(a) == 1 and a[0] == -1 or a[0] > 0.98:
+                        print(k)
+                    #if a > 0.97 or a < 0.03:
+                    #   positions_to_remove.append(i)
                 position_freq = [a for i,a in enumerate(position_freq) \
                         if i not in positions_to_remove]
                 positions = [a for i,a in enumerate(positions) \
@@ -1037,25 +1054,23 @@ def group_files_analysis(file_folder):
                 
                 #try and see if this amplicon is messed up
                 binding_correct = test_amplicon(k, haplotype_percents, position_freq, mutations, positions)
-                if binding_correct is False:
-                    print(k, haplotype_percents, position_freq, binding_correct)
                 
-            
-                #TEST LINES
-                """
-                if int(k) == 23514:
-                    print('primer', k,\
-                            'haplotype percents', haplotype_percents, \
-                            'position freq', position_freq, \
-                            'mutations', mutations, \
-                            'positions', positions)
-                """
+                if binding_correct is False:                
+                    for pk, pv in primer_dict.items():
+                        if int(pv[0]) == int(k): 
+                            improper_primers.append(pk)
 
-            sys.exit(0)
-             
+            
+            #for this file also fetch this mismatched primers
+            mismatched_primers = []
+            masked_loc = os.path.join("/home/chrissy/Desktop/masked", "masked_"+basename+".txt")
+            with open(masked_loc, 'r') as mfile:
+                for line in mfile:
+                    mismatched_primers.append(line.strip()[:-1])
+            mistmatched_primers = list(np.unique(mismatched_primers))            
+
             cluster_center_sums = []
             all_cluster_centers = []
-            cluster_centers=[]
             all_sil=[]
             
             total_haplotype_reshape = np.array(total_haplotype_freq).reshape(-1,1)
@@ -1070,8 +1085,7 @@ def group_files_analysis(file_folder):
                 #kmeans clustering
                 kmeans = KMeans(n_clusters=num, random_state=10).fit(total_haplotype_reshape)
                 centers = kmeans.cluster_centers_            
-                #print(centers, silhouette_score(total_mutation_reshape, kmeans.labels_))
-                #print(kmeans.labels_)
+ 
                 flat_list = [item for sublist in centers for item in sublist]
                 all_cluster_centers.append(flat_list)                    
                 
@@ -1083,13 +1097,10 @@ def group_files_analysis(file_folder):
                 
                 lowest_value_highest_cluster.append(min(smallest_value_largest_cluster))
                 
-               
                 #this would be the "less ambiguous" method of calling consensus 
                 highest_value_highest_cluster.append(max(smallest_value_largest_cluster))
                  
-                cluster_center_sums.append(sum(flat_list))
-                
-                
+                cluster_center_sums.append(sum(flat_list)) 
                 all_sil.append(silhouette_score(total_haplotype_reshape, kmeans.labels_))
                 
                     
@@ -1099,6 +1110,7 @@ def group_files_analysis(file_folder):
                 loc = all_sil.index(best_fit)
                 best_fit = min(cluster_center_sums, key=lambda cluster_center_sums : abs(cluster_center_sums -1))
                 loc=cluster_center_sums.index(best_fit)
+
                 cluster_centers=all_cluster_centers[loc]
                 cluster_opt = possible_explanations[loc]
                 possible_threshold_low = lowest_value_highest_cluster[loc]
@@ -1119,15 +1131,18 @@ def group_files_analysis(file_folder):
                      'cluster_centers': cluster_centers,\
                      'sil_opt_cluster':cluster_opt,\
                      'sil':act_sil,\
-                     'threshold':possible_threshold, "threshold_amb":possible_threshold_amb}
-                
+                     'threshold_low':possible_threshold, "threshold_high":possible_threshold_amb, \
+                     'masked_primers': mismatched_primers, 'frequency_flagged_primers': improper_primers}
+                            
             else: 
                 temp_dict[file_output.replace(".json","").replace(file_folder+"/","")]= {
                     'cluster_centers': 0,\
                     'sil_opt_cluster':0,\
                     'sil':0,\
-                    'threshold':0, 'threshold_amb':0}
-        
+                    'threshold_low':0, 'threshold_high':0, 'masked_primers': 0, \
+                    'frequency_flagged_primers': 0 }
+        if TEST:
+            print(temp_dict)
     df_outcome = pd.DataFrame(temp_dict).T
     df_outcome = df_outcome.reset_index()
     final_df = df_outcome.merge(meta_df, on='index', how='left')

@@ -15,6 +15,15 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 
+
+def create_lineplot(x, y, x_axis, y_axis, save_name):
+    """
+    Function creates a lineplot using seaborn.
+    """
+
+    pass    
+
+
 def calculate_positional_depths(bam, dropped_reads=None):
     """
     Creates a dict for each position with nucs, depths, and qual.
