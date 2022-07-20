@@ -32,7 +32,7 @@ def retrim_bam_files(bam, basename, output_dir, ref_seq, primer_bed):
     fastq1 = os.path.join(output_dir, basename + "_r1.fq")
     fastq2 = os.path.join(output_dir, basename + "_r2.fq")
     intermediate_sorted = os.path.join(output_dir, basename + ".sorted.intermediate.bam")
-    intermediate_trimmed = os.path.join(output_dir, basename + ".trimmed.intermediate.bam")
+    intermediate_trimmed = os.path.join(output_dir, basename + ".trimmed.intermediate")
     intermediate_tag = os.path.join(output_dir, basename + ".pretag.bam")
     final_bam = os.path.join(output_dir, basename + ".final.bam")
 
@@ -45,7 +45,7 @@ def retrim_bam_files(bam, basename, output_dir, ref_seq, primer_bed):
     os.system(cmd2)
     cmd3 = "ivar trim -b %s -p %s -i %s" %(primer_bed, intermediate_trimmed, intermediate_sorted)
     os.system(cmd3)
-    cmd4 = "samtools sort -o %s %s" %(intermediate_tag, intermediate_trimmed)     
+    cmd4 = "samtools sort -o %s %s" %(intermediate_tag, intermediate_trimmed+".bam")     
     os.system(cmd4)
     cmd5 = "samtools index %s" %(intermediate_tag)
     os.system(cmd5)
@@ -54,15 +54,17 @@ def retrim_bam_files(bam, basename, output_dir, ref_seq, primer_bed):
     cmd7 = "samtools index %s" %(final_bam)
     os.system(cmd7)    
 
+    #print(cmd, "\n", cmd1, "\n", cmd2, "\n", cmd3, "\n", cmd4, "\n", cmd5, "\n", cmd6, "\n", cmd7)
+    
     os.system("rm %s" %intermediate_name)
     os.system("rm %s" %fastq1)
     os.system("rm %s" %fastq2)
     os.system("rm %s" %intermediate_sorted)
     os.system("rm %s" %(intermediate_sorted+".bai"))
-    os.system("rm %s" %intermediate_trimmed)
+    os.system("rm %s" %intermediate_trimmed+".bam")
     os.system("rm %s" %(intermediate_tag+".bai"))
     os.system("rm %s" %intermediate_tag)
-
+    
     return(final_bam)
 
 def call_consensus(filename, output_filename, threshold):

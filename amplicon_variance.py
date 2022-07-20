@@ -21,8 +21,9 @@ from scipy.spatial.distance import cosine
 from sklearn.metrics import silhouette_score
 
 
-from util import calculate_positional_depths
-from call_external_tools import call_variants, call_getmasked, retrim_bam_files
+from util import calculate_positional_depths, create_regression_plot, create_barplot
+from call_external_tools import call_variants, call_getmasked, \
+    retrim_bam_files, call_consensus
 
 def warn(*args, **kwargs):
     pass
@@ -50,8 +51,8 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     returns the relative propotion of amplicon level haplotypes observed and positions in which mutations
     occur. 
     """
-    if TEST:
-        print("extracting amplicons for ", primer_0)
+    #if TEST:
+    print("extracting amplicons for ", bam, primer_0)
 
     #adjust for ends of possible reads
     primer_0 -= 1
@@ -73,7 +74,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     #qualities for this amp
     quality_matrix = []
  
-    #amp len
+    #amp len CHANGED
     amp_len = primer_1 - primer_0
     amp_indexes = list(range(primer_0, primer_1))
     
@@ -218,7 +219,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     #iterate by position
     for c, (pos_array, qual_array) in enumerate(zip(read_matrix.T, quality_matrix.T)):
         gt_pos = c+primer_0
-
+ 
         #positions that match the reference
         match_ref = pos_array[pos_array==0]
         #positions that are soft clipped
@@ -280,10 +281,10 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
 
         #total used
         cc = 0
+        
         for count, (thing,thing2) in enumerate(zip(filter_matrix.T, read_matrix_filt.T)):
             if -1 in thing2 or -1 in thing:
-                continue
-            
+                continue 
             #counts toward our total haplotype depth
             cc += 1
 
@@ -305,8 +306,8 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
                 loc = groups.index(stringify)
                 group_counts[int(loc)] += 1
     
-    
-    group_percents = [x/cc for x in group_counts]     
+    #print(group_counts, groups, cc)
+    group_percents = [x/cc for x in group_counts]   
      
     #remove low occuring groups
     positions_to_remove = []
@@ -329,9 +330,6 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
 
     
     if TEST:
-        """
-        Groups2 represents the overall postion depth.
-        """
         print("poi", poi, "\n",\
                 "haplotype percents", group_percents, "\n", \
                 "mutation groups", mut_groups, "\n", \
@@ -339,7 +337,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
                 )
         for p in poi:
             print(p, pos_dict[str(p)])
-        
+        sys.exit(0) 
     return(poi, group_percents, found_amps, groups2, mut_groups)
 
 
@@ -416,9 +414,16 @@ def parallel(primer_dict, bam, total_pos_depths, noise_dict, primer_dict_inner, 
  
     with open("../json/%s.json" %basename, "w") as jfile:
         json.dump(file_level_dict, jfile)
+    
+    print(basename, "finished processing")
 
 def parse_snv_output(csv_filename):
     """
+    Parameters
+    ----------
+    csv_filename : str
+        Full path the location of the .csv file with clustering output.
+
     Gets filenames and thresholds from the .csv file output.
     Returns dict with filenames and thresholds.
     """
@@ -446,30 +451,59 @@ def main():
     output_dir = "/home/chrissy/Desktop/retrimmed_bam"
     ref_seq = "/home/chrissy/Desktop/sequence.fasta"
     primer_bed = "/home/chrissy/Desktop/sarscov2_v2_primers.bed"
+    
+    primer_dict, primer_dict_inner  = get_primers(PRIMER_FILE) 
 
+    #sys.exit(0)    
+    """
     for filename in all_json:
-        if filename != "/home/chrissy/Desktop/spike_in/file_128_sorted.calmd.bam":
-            continue
+        #if filename != "/home/chrissy/Desktop/spike_in/file_125_sorted.calmd.bam":
+        #    continue
         basename = filename.split("/")[-1].split("_s")[0]
         if os.path.isfile(os.path.join(output_dir, basename+".final.bam")):
             continue
         final_bam = retrim_bam_files(filename, basename, output_dir, ref_seq, primer_bed)
-   
+        if TEST:
+            print(final_bam)
+
+    sys.exit(0)
+    """
+    """
     all_retrimmed = [x for x in os.listdir("../retrimmed_bam") if x.endswith(".bam")]
     all_retrimmed = [os.path.join("/home/chrissy/Desktop/retrimmed_bam", x) for x in all_retrimmed]
     
     for ar in all_retrimmed:
+        #if "file_124" not in ar:
+        #    continue
+        #print(ar)
         process(ar)
     sys.exit(0)
-
+    """
+    
+    all_simulated_data = [x for x in os.listdir("/home/chrissy/Desktop/simulated_data/final_simulated_data") if x.endswith(".bam")]
+    all_simulated_data = [os.path.join("/home/chrissy/Desktop/simulated_data/final_simulated_data", x) for x in all_simulated_data]
+    
+    for sim_data in all_simulated_data:
+        process(sim_data)
+    sys.exit(0)
+    
+    process("/home/chrissy/Desktop/simulated_data/final_simulated_data/simulated_alpha_gamma_30_70.bam")
+    sys.exit(0)
+    
     #creates the .csv file with thresholds and other info
-    primer_dict, primer_dict_inner  = get_primers(PRIMER_FILE) 
-    group_files_analysis(file_folder, primer_dict)
+    group_files_analysis(file_folder, primer_dict, output_dir)
+    #sys.exit(0)    
+
+    snv_df = pd.read_csv("snv_output.csv")
+    simulated_metadata = pd.read_csv("../simulated_metadata.csv")
+    create_regression_plot(snv_df, simulated_metadata)    
+    create_barplot(snv_df, simulated_metadata)
     sys.exit(0)
 
     #sys.exit(0)
     #parses the tsv containing thresholding information
     file_threshold_dict = parse_snv_output("snv_output.csv")
+    
     """
     #remove old specific consensus thresholds
     con = [0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95]
@@ -515,6 +549,13 @@ def main():
 
 def analyze_nextstrain(filename, metadata):
     """
+    Parameters
+    ----------
+    filename : str 
+        Full path to the .tsv with nextclade output.
+    metadata : pd.DataFrame
+        Dataframe containing information to what is contained within the samples.    
+
     Parse apart nextclade file and analyze the consensus calling data.
     """
 
@@ -818,13 +859,17 @@ def process(bam):
     bam : str
         Path to the bam of interest.
     """
-    basename = bam.split("/")[-1].split(".")[0].replace("_sorted","")    
+    basename = bam.split("/")[-1].split(".")[0].replace("_sorted","")
     primer_file = "../sarscov2_v2_primers.bed"  
     reference_filepath = "../sequence.fasta"
     variants_output_dir = "../variants"
     bed_filepath = "../sarscov2_v2_primers.bed"
     primer_pair_filepath = "../primer_pairs.tsv"
     masked_output_dir = "../masked"
+    
+    if TEST is False:
+        if os.path.isfile("../json/"+basename+".json"):
+            return
     
     #this block calls get masked and variants
     variants_check = os.path.join(variants_output_dir, "variants_"+basename+".tsv")
@@ -851,7 +896,7 @@ def process(bam):
     else:
         with open("../pos_depths/%s_pos_depths.json" %basename, "r") as jfile:
             total_pos_depths = json.load(jfile)
-      
+    #return(0) 
     encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5}
     noise_dict = {}
     print_list = []
@@ -873,14 +918,14 @@ def process(bam):
      
     #gives us matches of primers by name
     primer_dict, primer_dict_inner  = get_primers(primer_file)
-    
-    n_jobs = 35
+        
+    n_jobs = 5
 
     #TEST LINES
     if TEST:
         test_dict = {}
         for k,v in primer_dict.items():
-            if int(v[0]) == 23514:
+            if int(v[0]) == 25027:
                 test_dict[k] = v
         primer_dict = test_dict
         n_jobs = 1 
@@ -923,15 +968,16 @@ def extract_amp_parallel_wrapper(k, v, bam, total_pos_depths, noise_dict,\
     
     return(primer_0, amplicon_level_dict)
 
-def group_files_analysis(file_folder, primer_dict, foi=None):  
+def group_files_analysis(file_folder, primer_dict, bam_dir):  
     """
     Parameters
     ----------
     file_folder : str
         Location where the .json files containing amplicon level mutations are found.
-
     primer_dict : dict
         Dictionary relating primers names to their start position.
+    bam_dir : str
+        Full path to the directory containing the .bam files.
 
     Function takes in a directory, and iterates the directory processing all json files.
     Each json file contains amplicon level information that is used to cluster within
@@ -951,31 +997,53 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
     meta_df = pd.DataFrame({"index":meta_filenames, "abundance_len":meta_abundance_count, \
         'abundance':[str(x) for x in meta_abundance], "variant":metadata_df['variant'].tolist()})
 
-    all_files = [x for x in os.listdir("../spike_in") if x.endswith('sorted.calmd.bam')]
-    json_filenames = [os.path.join(file_folder,(x.split('.')[0]+'.json').replace("_sorted","")) for x in all_files]
+    #get the json paths for the results
+    json_filenames = [os.path.join(file_folder, x) for x in os.listdir(file_folder) if x.endswith(".json")]
     
     #where we store all results prior to writing to .csv 
     temp_dict = {}
-
-    seen = [os.path.join(file_folder,"file_124.json")]
 
     #iterate through every output result
     for file_output in json_filenames:
         #can't open what doesn't exist --__(..)__--
         if not os.path.isfile(file_output):
             continue
-        if file_output not in seen:
-            continue
         
         basename = file_output.split("/")[-1].replace(".json","")
         
+        #for this file also fetch this mismatched primers
+        mismatched_primers = []        
+        masked_loc = os.path.join("/home/chrissy/Desktop/masked", "masked_"+basename+".txt")
+        with open(masked_loc, 'r') as mfile:
+            for line in mfile:
+                mismatched_primers.append(line.strip()[:-1])
+        mismatched_primers = list(np.unique(mismatched_primers))             
+
+        if TEST:
+            print("eval", basename)    
+
         #all the haplotype frequencies in one large list
         total_haplotype_freq = []
         total_mutation_freq = []
         total_positions = []
+        total_positions_extend = []
+        thf_condensed = [] #total haplotype frequencies with amplicon grouping
+        mf_condensed = []
         improper_primers = []
+        total_amps = []
 
         with open(file_output, 'r') as jfile:
+            if "simulated_" not in file_output:
+                continue
+            try:
+                filtered_meta = meta_df[meta_df['index']==basename]
+                ground_truth_list = ast.literal_eval(list(filtered_meta['abundance'])[0])
+                ground_truth_list.extend(ast.literal_eval(list(filtered_meta['variant'])[0]))
+                ground_truth = ' '.join([str(x) for x in ground_truth_list])
+            except:
+                ground_truth = basename.split("_")
+                ground_truth = " ".join(ground_truth)
+
             data = json.load(jfile)
             keys = list(data.keys())
 
@@ -983,14 +1051,14 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
             for k,v in data.items():
                 #if dictionary is empty keep going
                 if len(v) == 0:
-                    continue
-
+                    continue 
                 total_amp_depth = v['found_amps']
                  
                 #related to the halotypes
                 if total_amp_depth < 10:
-                    continue
-
+                    continue    
+                #if int(k) == 27701:
+                #    print(v)
                 haplotype_percents = v['haplotype_percents']
                 positions = v['poi']
                 position_freq = v['poi_freq']
@@ -1001,16 +1069,14 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
                     continue
                 
                 #TEST LINES                
-                """
-                if int(k) == 23601:
+                
+                """                
+                if int(k) == 21865:
                     print('primer', k,\
                             'haplotype percents', haplotype_percents, \
                             'position freq', position_freq, \
                             'mutations', mutations, \
-                            'positions', positions)
-                """
-                
-                """
+                            'positions', positions) 
                 positions_to_remove = [] 
                 for i, a  in enumerate(position_freq):
                     if len(a) == 1 and a[0] == -1 or a[0] > 0.98:
@@ -1047,40 +1113,40 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
 
                 if len(haplotype_percents) == 0:
                     continue
-
-                total_haplotype_freq.extend(haplotype_percents)
-                total_mutation_freq.extend(position_freq)   
-                total_positions.extend(positions)
-                
+               
                 #try and see if this amplicon is messed up
                 binding_correct = test_amplicon(k, haplotype_percents, position_freq, mutations, positions)
-                
-                if binding_correct is False:                
+                done = False
+                if binding_correct is False:
+                    done=True
+                    #print(k, position_freq, mutations, positions, haplotype_percents)                
                     for pk, pv in primer_dict.items():
                         if int(pv[0]) == int(k): 
                             improper_primers.append(pk)
-
-            
-            #for this file also fetch this mismatched primers
-            mismatched_primers = []
-            masked_loc = os.path.join("/home/chrissy/Desktop/masked", "masked_"+basename+".txt")
-            with open(masked_loc, 'r') as mfile:
-                for line in mfile:
-                    mismatched_primers.append(line.strip()[:-1])
-            mistmatched_primers = list(np.unique(mismatched_primers))            
-
+                            if pk in mismatched_primers:
+                                done = True
+                if done is False:    
+                    thf_condensed.append(haplotype_percents) 
+                    mf_condensed.append(position_freq)
+                    total_positions_extend.extend(positions)
+                    total_haplotype_freq.extend(haplotype_percents)
+                    total_amps.extend([k]*len(haplotype_percents))
+                    total_mutation_freq.extend(position_freq)   
+                    total_positions.append(positions)
+      
             cluster_center_sums = []
             all_cluster_centers = []
             all_sil=[]
+            all_labels = []
             
             total_haplotype_reshape = np.array(total_haplotype_freq).reshape(-1,1)
-            total_mutation_reshape = np.array(total_mutation_freq).reshape(-1,1)
-            
+            total_mutation_flat = [item for sublist in total_mutation_freq for item in sublist]
+            total_mutation_reshape = np.array([item for sublist in total_mutation_freq for item in sublist]).reshape(-1,1)
+
             lowest_value_highest_cluster = []
             highest_value_highest_cluster = [] 
             
             possible_explanations = list(range(2,6)) 
-            
             for num in possible_explanations:           
                 #kmeans clustering
                 kmeans = KMeans(n_clusters=num, random_state=10).fit(total_haplotype_reshape)
@@ -1088,13 +1154,14 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
  
                 flat_list = [item for sublist in centers for item in sublist]
                 all_cluster_centers.append(flat_list)                    
-                
+                all_labels.append(kmeans.labels_)                
+
                 #here we find the smallest value in the "highest freq" cluster
                 largest_cluster_center = max(flat_list)
                 label_largest_cluster = flat_list.index(largest_cluster_center)
                 smallest_value_largest_cluster = \
                     [v for v,l in zip(total_haplotype_freq, kmeans.labels_) if l == label_largest_cluster]
-                
+                 
                 lowest_value_highest_cluster.append(min(smallest_value_largest_cluster))
                 
                 #this would be the "less ambiguous" method of calling consensus 
@@ -1108,15 +1175,27 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
             if len(all_sil) != 0:        
                 best_fit = max(all_sil)
                 loc = all_sil.index(best_fit)
-                best_fit = min(cluster_center_sums, key=lambda cluster_center_sums : abs(cluster_center_sums -1))
-                loc=cluster_center_sums.index(best_fit)
-
                 cluster_centers=all_cluster_centers[loc]
                 cluster_opt = possible_explanations[loc]
                 possible_threshold_low = lowest_value_highest_cluster[loc]
                 possible_threshold_high = highest_value_highest_cluster[loc]
                 act_sil = all_sil[loc]
+                used_labels = all_labels[loc]
+                 
+                mismatched_primer_starts = []
+                for k, v in primer_dict.items():
+                    if k in mismatched_primers:
+                        mismatched_primer_starts.append(v[0])
+                freq_flagged_starts = [] 
+                for k, v in primer_dict.items():
+                    if k in improper_primers:
+                        freq_flagged_starts.append(v[0])
                 
+                #let's graph the used labels and the haplotype freq/positons
+                graph_clusters(used_labels, cluster_centers, thf_condensed, total_positions, mf_condensed,
+                    total_haplotype_freq, total_positions_extend, basename, ground_truth, total_amps, \
+                    mismatched_primer_starts, freq_flagged_starts)   
+
                 #print(possible_threshold_high, possible_threshold_low)
                 cluster_centers.sort(reverse=True)
                 try:
@@ -1126,13 +1205,14 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
                     possible_threshold=0
                     possible_threshold_amb=0
                 
-                
+                overlap_primers = [x for x in improper_primers if x in mismatched_primers]
                 temp_dict[file_output.replace(".json","").replace(file_folder+'/',"")]= {
                      'cluster_centers': cluster_centers,\
                      'sil_opt_cluster':cluster_opt,\
                      'sil':act_sil,\
                      'threshold_low':possible_threshold, "threshold_high":possible_threshold_amb, \
-                     'masked_primers': mismatched_primers, 'frequency_flagged_primers': improper_primers}
+                     'masked_primers': mismatched_primers, 'frequency_flagged_primers': improper_primers, \
+                     'poor_primers': overlap_primers}
                             
             else: 
                 temp_dict[file_output.replace(".json","").replace(file_folder+"/","")]= {
@@ -1140,7 +1220,7 @@ def group_files_analysis(file_folder, primer_dict, foi=None):
                     'sil_opt_cluster':0,\
                     'sil':0,\
                     'threshold_low':0, 'threshold_high':0, 'masked_primers': 0, \
-                    'frequency_flagged_primers': 0 }
+                    'frequency_flagged_primers': 0, 'poor_primers':0 }
         if TEST:
             print(temp_dict)
     df_outcome = pd.DataFrame(temp_dict).T
@@ -1166,13 +1246,16 @@ def test_amplicon(primer_0, haplotype_percents, position_freq, mutations, pos):
     that occur, and if they differ siginficantly return False.
     """
     correct=True
+    if str(primer_0) == '28800':
+        print(primer_0 , haplotype_percents, position_freq, mutations, pos)
+
     #we iterate through each haplotype frequency
     for hp,mut,pf in zip(haplotype_percents, mutations, position_freq):
         for f in pf:
             #uninformative frequencies
             if f == 0 or f == -1 or f > 0.97:
                 continue
-            if abs(f-hp) > 0.20:
+            if abs(f-hp) > 0.15:
                 correct=False
         if correct is False:
             #print(primer_0, haplotype_percents, position_freq, mutations,pos)
@@ -1442,6 +1525,153 @@ def single_file_mutation_graph(files, gt_dict, metadata, df):
     plt.tight_layout() 
     plt.savefig("heat_10_90_gamma_alpha.png")
     plt.close()
-  
+
+def parse_key_mutations():
+    mutations_table = "../key_mutations.csv"
+    gene_table = "../gene_result.txt"
+
+    df = pd.read_csv(mutations_table)
+
+    gene_df = pd.read_table(gene_table, usecols=['start_position_on_the_genomic_accession', \
+        'end_position_on_the_genomic_accession', 'Symbol'])    
+
+    total_pos_dict = {}
+    for index, row in df.iterrows():
+        gene = row['gene']
+        aa = row['amino acid']
+        
+        if gene == 'ORF1b':
+            gene = 'ORF1ab'
+
+        if 'DEL' not in aa and 'del' not in aa:
+            aa_loc = int(aa[1:-1])
+    
+        start=''
+        for i, r in gene_df.iterrows():
+            if gene in r['Symbol']:
+                start = int(r['start_position_on_the_genomic_accession'])
+                break
+            
+        lineage = row['lineage']
+        total_pos = (aa_loc*3)+start-3 
+        total_pos_list = [total_pos-1, total_pos, total_pos+1]
+        
+        if lineage not in total_pos_dict:
+            total_pos_dict[lineage] = total_pos_list
+        else:
+            total_pos_dict[lineage].extend(total_pos_list)
+
+    return(total_pos_dict)
+
+def graph_clusters(used_labels, used_centers, thf_condensed, positions, mutations, \
+    total_haplotype_freq, total_positions_extend, basename, ground_truth, amps, mismatched_primer_starts, \
+    freq_flagged_starts):
+    """
+    Function takes in the labels, cluster labels, and positions and graphs them.
+    """
+    print("creating graph plot")
+    total_pos_dict = parse_key_mutations()
+    #print(total_pos_dict)
+    count = 0
+        
+    total_lineages = []
+    pos_refactor = []
+    #let's expand to associate certain lineages with a haplotype
+    for c, (pos, muts) in enumerate(zip(positions, mutations)):
+        #this iterates at the haplotype level
+        for z,mut in enumerate(muts):
+            remove = []
+            for i,m in enumerate(mut):
+                if m == 0:
+                    remove.append(i)    
+            p = [x for i,x in enumerate(pos) if i not in remove]    
+            found_lin = "None"
+            
+            for p1 in p:
+                label = used_labels[count]
+                for k,v in total_pos_dict.items():
+                    if p1 in v:
+                        found_lin = k
+                        break
+                if found_lin != "None":
+                    break
+            pos_refactor.append(pos)
+            total_lineages.append(found_lin)
+    """
+    print(
+        "total lineages", len(total_lineages), "\n",
+        "used labels", len(used_labels), "\n",
+        "total haplotype freq", len(total_haplotype_freq), "\n",
+        "total positions", len(total_positions_extend), "\n",
+        "position refactor", len(pos_refactor)
+    )
+    """
+    unique_lineages = list(np.unique(total_lineages))
+    unique_labels = list(np.unique(used_labels))
+    combination_total = []
+    for ul in unique_lineages:
+        for lab in unique_labels:
+            combination_total.append(str(ul)+"_"+str(lab)) 
+
+    markers = [',', 'X', 'o', 'v', '^', '<', '>', '8', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', '.']
+    colors = ['orange', 'purple', 'green', 'blue', 'red']
+
+    m_list = []
+    c_list = []
+    h_list = []
+    
+    for tl, ul, thf in zip(total_lineages, used_labels, \
+        total_haplotype_freq): 
+        marker_loc = unique_lineages.index(tl)
+        color_loc = unique_labels.index(ul)
+        m_list.append(tl)
+        c_list.append(ul)
+        h_list.append(thf)
+        
+   
+    y = []
+    for m,c in zip(m_list,c_list):
+        loc_s = str(m)+"_"+str(c)        
+        y.append(combination_total.index(loc_s))
+    mark = markers[:len(np.unique(m_list))]  
+    c_list = ['cluster '+str(x) for x in c_list]
+    sns.scatterplot(h_list, y, hue=c_list, style=m_list, markers=mark)
+    sns.despine(top=True, right=True, left=True, bottom=False)
+
+    plt.title("%s Clustering Results by Lineage Haplotype and Frequency" %ground_truth, fontsize=7) 
+    plt.yticks([])
+    plt.xlabel("Haplotype Frequency") 
+    plt.legend(bbox_to_anchor=(0.90, 1), loc='upper left', borderaxespad=0)
+    plt.savefig("./figures/%s_event_plot.png" %ground_truth)
+    plt.close()
+     
+    #pick out signals that belong to the wrong cluster
+    dist_cluster_1 = []
+    dist_cluster_2 = []
+    amp_cluster_1 = []
+    amp_cluster_2 = []
+    pos_cluster_1 = []
+    pos_cluster_2 = []
+
+    #print(mismatched_primer_starts)
+    for tl, ul, thf, tp,a in zip(total_lineages, used_labels, \
+        total_haplotype_freq, pos_refactor, amps):
+        if ul == 0 and tl == "gamma":
+            print(tl, ul, thf, tp, a)
+        if ul == 0:
+            dist_cluster_1.append(abs(used_centers[1]-thf))
+            amp_cluster_1.append(a)
+            pos_cluster_1.append(tp)
+        if ul == 1:
+            dist_cluster_2.append(abs(used_centers[0]-thf))
+            amp_cluster_2.append(a)
+            pos_cluster_2.append(tp)
+
+    dist_cluster_1, amp_cluster_1, pos_cluster_1 = zip(*sorted(zip(dist_cluster_1, amp_cluster_1, pos_cluster_1), reverse=True))
+    #print(dist_cluster_1, "\n", amp_cluster_1, "\n", pos_cluster_1)
+    
+    dist_cluster_2, amp_cluster_2, pos_cluster_2 = zip(*sorted(zip(dist_cluster_2, amp_cluster_2, pos_cluster_2), reverse=True))
+    #print(dist_cluster_2, "\n", amp_cluster_2, "\n", pos_cluster_2) 
+
 if __name__ == "__main__":
     main()

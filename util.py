@@ -1,4 +1,5 @@
 import os
+import ast
 import math
 import copy
 import time
@@ -14,8 +15,75 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
+def create_barplot(snv_output, metadata):
+    """
+    Function plots the silhoutte score 
+    """
+    print("create barplot")
 
+    #merge
+    merged_df = metadata.merge(snv_output, left_on="filename", right_on="index", how="right")
+    
+    labels = []
+    counts = []
+    for index, row in merged_df.iterrows():
+        population_1 = row['percent_1']
+        population_2 = row['percent_2']
+        label_str = '%s/%s' %(population_1, population_2)
+        sil = row['sil']
+        
+        #append to list
+        labels.append(label_str)
+        counts.append(sil)
+        
+    order_list = ['50.0/50.0', '40.0/60.0', '35.0/65.0', '30.0/70.0', '15.0/85.0', '10.0/90.0', '5.0/95.0']
+    x = list(np.arange(0, len(labels)))
+    sns.set_style("whitegrid")
+    g = sns.scatterplot(x=x, y=counts, color='purple', s=100)
+    plt.xticks(x,labels)
+    plt.ylabel("Silhoutte Score")
+    plt.savefig("./figures/barplot.png")
 
+def create_regression_plot(snv_output, metadata):
+    """
+    Function takes in the cluster centers and the metadata dataframe
+    and plot a regression of the two.
+    """
+    print('creating regression plot')
+
+    #ground truth    
+    x = []
+    #experimental values
+    y = []
+
+    #merge
+    merged_df = metadata.merge(snv_output, left_on="filename", right_on="index", how="right")
+    for index, row in merged_df.iterrows():
+        population_1 = row['reads_1'] / row['total_reads']
+        population_2 = row['reads_2'] / row['total_reads']
+        cluster_centers = ast.literal_eval(row["cluster_centers"])
+        
+        population_list = [population_1, population_2]
+        population_list.sort(reverse=True)
+        cluster_centers.sort(reverse=True)
+        if len(cluster_centers) != len(population_list):
+            print(row['index'], population_list, cluster_centers)
+            if len(cluster_centers) > len(population_list):
+                num_zeros = len(cluster_centers) - len(population_list)        
+                population_list.extend([0.0]*num_zeros)        
+           
+        x.extend(population_list)
+        y.extend(cluster_centers)
+
+    plt.plot([0,1],[0,1], color='orange', linestyle='--')
+    print(x,y)
+    sns.regplot(x,y, color='purple')
+    plt.xlabel("Population Frequencies")
+    plt.ylabel("Cluster Center Values")
+    plt.grid(visible=True, color='lightgrey')
+    plt.savefig("./figures/regression_plot.png")     
+    plt.close()
+    
 def create_lineplot(x, y, x_axis, y_axis, save_name):
     """
     Function creates a lineplot using seaborn.
