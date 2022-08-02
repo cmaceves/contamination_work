@@ -15,13 +15,15 @@ import seaborn as sns
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn import cluster
 from sklearn.cluster import KMeans
 from joblib import Parallel, delayed
+from scipy.spatial import distance
+import matplotlib.patches as mpatches
 from scipy.spatial.distance import cosine
 from sklearn.metrics import silhouette_score
-
-
-from util import calculate_positional_depths, create_regression_plot, create_barplot
+from sklearn.preprocessing import StandardScaler
+from util import calculate_positional_depths, create_regression_plot, create_barplot, create_boxplot
 from call_external_tools import call_variants, call_getmasked, \
     retrim_bam_files, call_consensus
 
@@ -31,6 +33,8 @@ def warn(*args, **kwargs):
 warnings.warn = warn
 TEST=False
 PRIMER_FILE = "/home/chrissy/Desktop/sarscov2_v2_primers.bed"
+GT_STRAINS = {'alpha': 'B.1.1.7', 'beta':'B.1.351', 'gamma':'P.1', 'delta':'B.1.617.2'}
+metadata_path = '../spike-in_bams_spikein_metadata.csv'
 
 def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
         noise_dict, pos_dict, primer_drops=None):
@@ -253,13 +257,8 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
         values, counts = np.unique(mutations, return_counts=True)
         percent = [x/total_depth for x in counts]
  
-        #remove low level mutations
-        final = [z for z in zip(percent, values) if z[0] > 0.03]
-        
-
-        if len(final) > 0:
-            relative_poi.append(c)
-            poi.append(c+primer_0)
+        relative_poi.append(c)
+        poi.append(c+primer_0)
 
     if read_matrix.ndim < 2:
         read_matrix = np.zeros((0,0))  
@@ -270,6 +269,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     groups2 = []
     mut_groups = []
     poi_order=[]
+
     if len(relative_poi) > 0:
         filter_matrix = freq_matrix.T[relative_poi]
         read_matrix_filt = read_matrix.T[relative_poi]
@@ -309,6 +309,7 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
     #print(group_counts, groups, cc)
     group_percents = [x/cc for x in group_counts]   
      
+    """
     #remove low occuring groups
     positions_to_remove = []
     for i, perc in enumerate(group_percents):
@@ -318,26 +319,70 @@ def extract_amplicons(bam, primer_0, primer_1, primer_0_inner, primer_1_inner, \
             del groups[i]
             del groups2[i]
             del mut_groups[i]
-
+    
     group_percents = [a for i,a in enumerate(group_percents) if i not in positions_to_remove]
     groups = [a for i,a in enumerate(groups) if i not in positions_to_remove]
     groups2 = [a for i,a in enumerate(groups2) if i not in positions_to_remove]
     mut_groups = [a for i,a in enumerate(mut_groups) if i not in positions_to_remove]
+    """
 
     #if we've managed to eliminate all haplotypes, remove poi too
     if len(group_percents) == 0:
         poi = []
 
+    #let's make sure that we don't have a strange haplotype split
+    #check to make sure that the haplotypes are sufficiently different if 
+    #our mutations for this amplicon exceed 2
+    removal = []
+    if len(poi) > 2:    
+        add_to = [] 
+        add_val = []
+        for i,(hp,mg,g2)  in enumerate(zip(group_percents, mut_groups, groups2)):  
+            #if the haplotype is less than 10% we consider it for merge
+            if hp < 0.10:
+                for i2, g3 in enumerate(groups2):
+                    if i in removal:
+                        continue    
+                    #we're looking at the same group
+                    if g3 == g2:
+                        continue
+                    #cosine similarity
+                    sim_score= 1 - cosine(g3,g2)
+                    if sim_score > 0.7:
+                        print(
+                            "groups2", groups2, "\n",\
+                            "add", g2, " to ", g3, "\n"
+                            )
+                        #this is matching with a group that's already been collapsed
+                        if i2 in add_to or i in removal:
+                            loc = add_to.index(i2)
+                            removal.append(i)
+                            add_to.append(add_to[loc])
+                            add_val.append(hp)
+                        else:
+                            removal.append(i)
+                            add_to.append(i2)
+                            add_val.append(hp)
     
+    removal.sort(reverse=True)
+    
+    if len(removal) > 0:
+        for x,y in zip(add_to, add_val):
+            group_percents[x] += y
+        print(group_percents)
+        for i in removal:
+            del group_percents[i]
+            del mut_groups[i]
+            del groups2[i]
+           
     if TEST:
-        print("poi", poi, "\n",\
+        print("primer 0", primer_0, "\n", \
+                "poi", poi, "\n",\
                 "haplotype percents", group_percents, "\n", \
                 "mutation groups", mut_groups, "\n", \
                 "groups2", groups2
                 )
-        for p in poi:
-            print(p, pos_dict[str(p)])
-        sys.exit(0) 
+        sys.exit(0)
     return(poi, group_percents, found_amps, groups2, mut_groups)
 
 
@@ -431,34 +476,28 @@ def parse_snv_output(csv_filename):
     file_threshold_dict = {}
     df = pd.read_csv(csv_filename)
     for index, row in df.iterrows():
-        thresh = row['threshold']
+        thresh_low = row['threshold_low'] + 0.10
         filename = row['index']
-        other_thresh = row['threshold_amb']
-        bam_filename = "../spike_in/" + filename + "_sorted.calmd.bam"
-        file_threshold_dict[bam_filename] = {"threshold": round(thresh,2), "output": "../consensus/"+\
-            filename +"_"+ str(round(thresh,2)), 'other_thresh':round(other_thresh,2), "other_output": \
-            "../consensus/"+filename+"_"+str(round(other_thresh,2))}
-
+        thresh_high = row['threshold_high'] - 0.10
+        bam_filename = "../simulated_data/final_simulated_data/" + filename + ".bam"
+        file_threshold_dict[bam_filename] = {"threshold_low": round(thresh_low,2), "output_low": "../consensus/low_10/"+\
+            filename +"_"+ str(round(thresh_low,2)), 'threshold_high':round(thresh_high,2), "output_high": \
+            "../consensus/high_10/"+filename+"_"+str(round(thresh_high,2))}
     return(file_threshold_dict)
 
-def main():
-    #list all json files
-    all_json = [x for x in os.listdir("../spike_in") if x.endswith('.bam')]
-    all_json = [os.path.join("/home/chrissy/Desktop/spike_in",x) for x in all_json]
-    
-    file_folder = "../json"
-    
-    output_dir = "/home/chrissy/Desktop/retrimmed_bam"
-    ref_seq = "/home/chrissy/Desktop/sequence.fasta"
-    primer_bed = "/home/chrissy/Desktop/sarscov2_v2_primers.bed"
-    
-    primer_dict, primer_dict_inner  = get_primers(PRIMER_FILE) 
 
-    #sys.exit(0)    
+def retrim_bam_files(all_filenames, output_dir):
     """
-    for filename in all_json:
-        #if filename != "/home/chrissy/Desktop/spike_in/file_125_sorted.calmd.bam":
-        #    continue
+    Parameters
+    ----------
+    all_filenames : list
+        List of full paths to retrim.
+    output_dir : str
+        Directory to output files to.
+
+    Function to take the original .bam files in and retrim them for consistency.
+    """
+    for filename in all_filenames:
         basename = filename.split("/")[-1].split("_s")[0]
         if os.path.isfile(os.path.join(output_dir, basename+".final.bam")):
             continue
@@ -466,88 +505,185 @@ def main():
         if TEST:
             print(final_bam)
 
-    sys.exit(0)
-    """
-    """
-    all_retrimmed = [x for x in os.listdir("../retrimmed_bam") if x.endswith(".bam")]
-    all_retrimmed = [os.path.join("/home/chrissy/Desktop/retrimmed_bam", x) for x in all_retrimmed]
-    
-    for ar in all_retrimmed:
-        #if "file_124" not in ar:
-        #    continue
-        #print(ar)
-        process(ar)
-    sys.exit(0)
-    """
-    
-    all_simulated_data = [x for x in os.listdir("/home/chrissy/Desktop/simulated_data/final_simulated_data") if x.endswith(".bam")]
-    all_simulated_data = [os.path.join("/home/chrissy/Desktop/simulated_data/final_simulated_data", x) for x in all_simulated_data]
-    
-    for sim_data in all_simulated_data:
-        process(sim_data)
-    sys.exit(0)
-    
-    process("/home/chrissy/Desktop/simulated_data/final_simulated_data/simulated_alpha_gamma_30_70.bam")
-    sys.exit(0)
-    
-    #creates the .csv file with thresholds and other info
-    group_files_analysis(file_folder, primer_dict, output_dir)
-    #sys.exit(0)    
 
-    snv_df = pd.read_csv("snv_output.csv")
-    simulated_metadata = pd.read_csv("../simulated_metadata.csv")
-    create_regression_plot(snv_df, simulated_metadata)    
-    create_barplot(snv_df, simulated_metadata)
-    sys.exit(0)
+def main():
+    DATA_TYPE = "simulated"
+    REF_SEQ = "/home/chrissy/Desktop/sequence.fasta"
+    RETRIM_BAMS = False
+    PROCESS_DATA = True
+    POST_PROCESS = False
+    VISUALIZE = False
+    CONSENSUS = False
+    NEXTSTRAIN_ANALYSIS = False
+    METRIC = "bic" 
+    n_jobs = 7
+ 
+    if DATA_TYPE == "wastewater":
+        datapath = "/home/chrissy/Desktop/retrimmed_bam" 
+    elif DATA_TYPE == "simulated":
+        datapath = "/home/chrissy/Desktop/simulated_data/final_simulated_data"
 
-    #sys.exit(0)
-    #parses the tsv containing thresholding information
-    file_threshold_dict = parse_snv_output("snv_output.csv")
-    
-    """
-    #remove old specific consensus thresholds
-    con = [0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95]
-    for filename in os.listdir("../consensus"):
-        filename_check = filename.split("_")[-1].replace(".fa","")
-        if float(filename_check) not in con:
-            os.system("rm %s" %(os.path.join("../consensus",filename)))
-    """
-    
-    #calls consensus using the above parsed thresholds
-    for k, v in file_threshold_dict.items():
-        print(k, " opt thresh")
-        threshold = v['threshold']
-        output_filename = v['output']
-        other_thresh = v['other_thresh']
-        other_output=v['other_output']
-         
-        #if os.path.isfile(output_filename + ".fa"):
-        #    continue
-        if float(threshold) > 0.50:
-            call_consensus(k, output_filename, threshold)            
-        #if os.path.isfile(other_output + ".fa"):
-        #    continue
-        if float(other_thresh) > 0.5:
-            call_consensus(k, other_output, other_thresh)            
-    
-    sys.exit(0) 
-    #calls consensus using an array of thresholds 0.5-0.95 every 0.05 
-    """
-    possible_consensus = [round(x,2) for x in list(np.arange(0.5,1.00,0.05))]
-    for k,v in file_threshold_dict.items():
-        for pc in possible_consensus:
-            print(k, pc)
-            original_output = v['output']
-            new_output = '_'.join(original_output.split('_')[:-1]) + "_" + str(pc)
-            if os.path.isfile(new_output + ".fa"):
+    if PROCESS_DATA is True and RETRIM_BAMS is False:
+        all_filenames = [x for x in os.listdir(datapath) if x.endswith('.bam')]
+        all_filenames = [os.path.join(datapath, x) for x in all_filenames]
+        primer_dict, primer_dict_inner  = get_primers(PRIMER_FILE) 
+      
+    if PROCESS_DATA is True:     
+        for filename in all_filenames:
+            process(filename, n_jobs)
+
+    if POST_PROCESS is True:
+        #creates the .csv file with thresholds and other info
+        group_files_analysis(file_folder, primer_dict, output_dir)
+
+    if VISUALIZE is True:
+        snv_df = pd.read_csv("snv_output.csv")
+        simulated_metadata = pd.read_csv("../simulated_metadata.csv")
+        wastewater_metadata = pd.read_csv(metadata_path)
+        wastewater_metadata = reformat_metadata(wastewater_metadata)
+        create_regression_plot(snv_df, wastewater_metadata)    
+        create_boxplot(snv_df,  wastewater_metadata)
+
+    if CONSENSUS is True:
+        #parses the tsv containing thresholding information
+        file_threshold_dict = parse_snv_output("snv_output.csv") 
+
+        #remove old specific consensus thresholds
+        con = [0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95]
+       
+        #calls consensus using the above parsed thresholds
+        for k, v in file_threshold_dict.items():
+            #print("Calling consensus on ", k)
+            thresh_low = v['threshold_low']
+            output_low = v['output_low']
+            thresh_high = v['threshold_high']
+            output_high =v['output_high']
+             
+            if os.path.isfile(output_low + ".fa"):
                 continue
-            call_consensus(k, new_output, pc)
-    """
-    metadata_path = './spike_in/spike-in_bams_spikein_metadata.csv'
-    #metadata_df = pd.read_csv("snv_output.csv")
-    #analyze_nextstrain("nextclade.tsv", metadata_df)
+                #if float(threshold) > 0.50:
+            call_consensus(k, output_low, thresh_low)            
+            if os.path.isfile(output_high + ".fa"):
+                continue
+                #if float(other_thresh) > 0.5:
+            call_consensus(k, output_high, thresh_high)
+         
+        """     
+        #calls consensus using an array of thresholds 0.5-0.95 every 0.05     
+        possible_consensus = [round(x,2) for x in list(np.arange(0.5,1.00,0.05))]
+        for k,v in file_threshold_dict.items():
+            for pc in possible_consensus:
+                new_output = k.split("/")[-1].split(".")[0]
+                new_output = "../consensus/steady/" + new_output + "_" + str(pc)           
+                if os.path.isfile(new_output + ".fa"):
+                    continue
+                call_consensus(k, new_output, pc)
 
-def analyze_nextstrain(filename, metadata):
+        sys.exit(0)
+        """
+
+    if NEXTSTRAIN_ANALYSIS is True:
+        metadata_df = pd.read_csv("snv_output.csv")
+        #lower_consensus_scramble(metadata_df)
+        threshold_variation_plot("../nextclade_plus_minus.csv", metadata_df)    
+        analyze_nextstrain("../low_nextclade.csv", "../high_nextclade.csv", metadata_df)
+
+
+def threshold_variation_plot(nextclade_filename, metadata):
+    """
+    Plots the results of varying the consensus threshold.
+    """
+    nextclade_results = pd.read_table(nextclade_filename, sep=';')
+
+    #color
+    filetype_list = []
+    #percent varied from threshold
+    percent_varied = []
+    #percent mutations missing from upper population
+    percent_mut_missing = []
+    #percent mutations from lower population
+    percent_mut_extra = []
+
+    mutations_table = "../key_mutations.csv"
+    df = pd.read_csv(mutations_table)
+    strain_muts = {'alpha':[], 'beta':[], 'delta':[], 'gamma':[]}
+    for index, row in df.iterrows():    
+        mut = row['gene'] + ":" + row['amino acid']
+        strain_muts[row['lineage']].append(mut)
+
+    test = 'simulated_alpha_delta_60_40' 
+    for index, row in nextclade_results.iterrows():
+        nextstrain_filename = row['seqName']
+        metadata_filename = "_".join(nextstrain_filename.split("_")[1:-6])        
+        if metadata_filename != test:
+            continue
+        print(metadata_filename)
+        direction = nextstrain_filename.split("_")[6]
+        variance= nextstrain_filename.split("_")[7]
+        gt_list = metadata_filename.split("_")        
+        if int(gt_list[-1]) > int(gt_list[-2]):
+            upper_strain = gt_list[-3]
+            filetype = gt_list[-2]+"/"+gt_list[-1]
+            lower_strain = gt_list[1]
+        else:
+            upper_strain = gt_list[1]
+            lower_strain = gt_list[-3]
+            filetype = gt_list[-1]+"/"+gt_list[-2]
+               
+        #expcted muts
+        #expected_muts = strain_muts[upper_strain]
+        #unexpected_muts = strain_muts[lower_strain]
+        expected_muts = get_mutations_vcf(upper_strain)
+        unexpected_muts = get_mutations_vcf(lower_strain)
+        #print(lower_strain, upper_strain)
+        #muts detected via nextclade
+        
+        muts = []
+        if str(row['substitutions']) != 'nan':
+            muts = [int(x[1:-1]) for x in row['substitutions'].split(",")]
+        if str(row['deletions']) != 'nan':
+            muts.extend(row['deletions'].split(","))
+        if str(row['insertions']) != 'nan':
+            muts.extend(row['insertions'].split(","))
+        
+        if direction == 'minus':
+            continue
+            percent_varied.append(-1*float(variance))
+        else:
+            percent_varied.append(float(variance))
+
+        filetype_list.append(str(filetype))
+        percent_recovered = len([x for x in muts if x in expected_muts])/len(expected_muts)
+        percent_mut_missing.append(percent_recovered)
+    
+    
+    sns.set_style("whitegrid")
+    sns.scatterplot(x=percent_varied, y=percent_mut_missing, hue=filetype_list)        
+    plt.savefig("./figures/scramble.png")
+ 
+def lower_consensus_scramble(metadata):
+    """
+    Takes the files where we think we can capture the upper population and varies the 
+    consensus threshold by 10 percent in +/- direction in 1 percent increments.
+    """
+    vary_threshold = [0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.10]
+    for index, row in metadata.iterrows():
+        sil_score = float(row['sil'])
+        lower_thresh = float(row['threshold_low'])
+        
+        #this is file can call consensus to capture the upper population
+        if sil_score > 0.75 and lower_thresh > 0.5:
+            for delta_thresh in vary_threshold:
+                output_file_one = "../consensus/plus_minus/"+row['index']+"_minus_"+str(delta_thresh)
+                output_file_two = "../consensus/plus_minus/"+row['index']+"_plus_"+str(delta_thresh)
+                thresh_one = lower_thresh - delta_thresh
+                thresh_two = lower_thresh + delta_thresh
+                
+                filename = "../simulated_data/final_simulated_data/"+row['index']+".bam"
+                call_consensus(filename, output_file_one, thresh_one)    
+                call_consensus(filename, output_file_two, thresh_two)
+        
+def analyze_nextstrain(filename, filename_2, metadata):
     """
     Parameters
     ----------
@@ -558,40 +694,114 @@ def analyze_nextstrain(filename, metadata):
 
     Parse apart nextclade file and analyze the consensus calling data.
     """
-
-    #hard coded s gene mutations per strain
-    s_gene_dict = {"alpha":[69,70,144,501,570,614,681,716,982,1118], \
-        "beta":[80,215,241,243,417,484,501,614,701], \
-        "delta":[19,156,157,158,452,478,614,681,950], \
-        "gamma":[18,20,26,138,190,417,484,501,614,655,1027,1176]}
-   
-    #list of 100% files that got properly processed
-    pure_files = ["file_320", "file_321", "file_323", "file_328", "file_331", "file_334", "file_337", \
-            "file_338", "file_339"]
-
-   
-    df = pd.read_table(filename)
-    test_file = "file_110"
+    
+    low_df = pd.read_table(filename, sep=';')
+    high_df = pd.read_table(filename_2, sep=';')
+    
      
-    #find and return a list of expected mutations based on the pure files
-    gt_dict = find_pure_file_mutations(pure_files, metadata, df)
-
-
     #plot where we chose to call consensus
     sil_scores = metadata['sil']
     filenames_meta = metadata['index'].tolist()
-    meta_threshold = metadata['threshold'].tolist()
-    amb_threshold = metadata['threshold_amb'].tolist() 
-    sil_dict = {filenames_meta[i]: {'sil':sil_scores[i], 'thresh':round(meta_threshold[i],2), \
-        'thresh_amb':amb_threshold[i]} for i in range(len(filenames_meta))}
+    threshold_low = metadata['threshold_low'].tolist()
+    threshold_high = metadata['threshold_high'].tolist() 
+
+    order_list = ['50/50', '45/55', '40/60', \
+              '35/65', '30/70', '25/75', '20/80', \
+              '15/85', '10/90', '05/95', '0/100']    
+    filetype_list = copy.deepcopy(order_list)
+    filetype_list.extend(filetype_list)
+    filetype_list.sort()
     
+    df_dict = {"filetype": filetype_list , "Attempt to Recover\nUpper Population": ['yes','no']*len(order_list), \
+        'count':[0]*len(filetype_list)}
+     
+    for index, row in metadata.iterrows():
+        gt_list = row['index'].split("_")                
+        if int(gt_list[-1]) > int(gt_list[-2]):
+            filetype = gt_list[-2]+"/"+gt_list[-1]
+        else:
+            filetype = gt_list[-1]+"/"+gt_list[-2]
+         
+        loc = df_dict['filetype'].index(filetype)
+        sil_score = float(row['sil'])
+        lower_thresh = float(row['threshold_low'])
+        
+        if sil_score > 0.75 and lower_thresh > 0.5:
+            df_dict['count'][loc] += 1
+        else:
+            loc += 1
+            df_dict['count'][loc] += 1
+
+    norm_list = []
+    base_val = 0
+    for i, item in enumerate(df_dict['count']):
+        if i % 2 == 1:
+            base_val += item
+            norm_list.append(base_val)
+            norm_list.append(base_val)
+            base_val = 0
+        else:
+            base_val += item
+    df_dict['count'] = [x/y for x,y in zip(df_dict['count'], norm_list)]
+    
+    create_barplot(pd.DataFrame(df_dict), "filetype", "count", "Attempt to Recover\nUpper Population")
+    
+    
+    #here we ask how many mutations are recovered from each of the mutations    
+
+    sys.exit(0)
+    
+    #did we recover the correct lineage? 
+    df_dict = {"filetype":[], "recovered": [], "not_recovered":[], "total":[]}
+
+    #did we recover the correct lineage?
+    for index, row in low_df.iterrows():
+        nextstrain_filename = row['seqName']
+        nextstrain_pango = row['Nextclade_pango']
+        metadata_filename = "_".join(nextstrain_filename.split("_")[1:-5])
+        metadata_row = metadata[metadata['index'] == metadata_filename]
+
+        gt_list = metadata_filename.split("_")        
+        if int(gt_list[-1]) > int(gt_list[-2]):
+            upper_strain = gt_list[-3]
+            filetype = gt_list[-2]+"/"+gt_list[-1]
+        else:
+            upper_strain = gt_list[1]
+            filetype = gt_list[-1]+"/"+gt_list[-2]
+        
+        sil_score = float(metadata_row['sil'])
+        lower_thresh = float(metadata_row['threshold_low'])
+        if sil_score > 0.75 and lower_thresh > 0.5:
+            exact_strain = GT_STRAINS[upper_strain] 
+            if nextstrain_pango == exact_strain:
+                recovered = True
+            else:
+                recovered = False
+            if filetype in df_dict['filetype']:
+                loc = df_dict['filetype'].index(filetype)
+                df_dict['total'][loc] += 1
+                if recovered is True:
+                    df_dict['recovered'][loc] += 1
+                else:
+                    df_dict['not_recovered'][loc] += 1                 
+            else:
+                df_dict['filetype'].append(filetype)
+                df_dict['total'].append(1)
+                if recovered is True:
+                    df_dict['recovered'].append(1)
+                    df_dict['not_recovered'].append(0)
+                else:
+                    df_dict['recovered'].append(0)
+                    df_dict['not_recovered'].append(1)
+
+    df_dict['recovered'] = [x/y for x,y in zip(df_dict['recovered'], df_dict['total'])]
+    df_dict['not_recovered'] = [x/y for x,y in zip(df_dict['not_recovered'], df_dict['total'])]
+    create_barplot(pd.DataFrame(df_dict)) 
+    sys.exit(0)
+
+   
     #plots varation in mutations found in technical replicates, and predicted thresholds
     #variation_in_technical_replicates(metadata, df)
-    single_file_mutation_graph(["file_124","file_125","file_127"], gt_dict, metadata, df)
-
-    #analyze primer binding sites
-    file_test_list = ["file_124","file_125","file_127"]
-
     sys.exit(0)
     global_tpr = []
     global_fpr = []
@@ -852,12 +1062,14 @@ def analyze_nextstrain(filename, metadata):
     plt.savefig("40_60_test.png")
     plt.close()
     
-def process(bam):
+def process(bam, n_jobs):
     """
     Parameters
     ----------
     bam : str
         Path to the bam of interest.
+    n_jobs : int
+        The number of jobs to concurrently run.
     """
     basename = bam.split("/")[-1].split(".")[0].replace("_sorted","")
     primer_file = "../sarscov2_v2_primers.bed"  
@@ -896,6 +1108,7 @@ def process(bam):
     else:
         with open("../pos_depths/%s_pos_depths.json" %basename, "r") as jfile:
             total_pos_depths = json.load(jfile)
+
     #return(0) 
     encoded_nucs = {"A":1,"C":2,"G":3,"T":4,"N":5}
     noise_dict = {}
@@ -916,16 +1129,12 @@ def process(bam):
             if count['count']/total_depth < 0.03:
                 noise_dict[int(k)].append(nt)
      
-    #gives us matches of primers by name
-    primer_dict, primer_dict_inner  = get_primers(primer_file)
-        
-    n_jobs = 5
 
     #TEST LINES
     if TEST:
         test_dict = {}
         for k,v in primer_dict.items():
-            if int(v[0]) == 25027:
+            if int(v[0]) == 21474:
                 test_dict[k] = v
         primer_dict = test_dict
         n_jobs = 1 
@@ -1033,20 +1242,26 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
         total_amps = []
 
         with open(file_output, 'r') as jfile:
-            if "simulated_" not in file_output:
+            if "simulated_" in file_output:
                 continue
-            try:
+            if "simulated_" not in file_output:
                 filtered_meta = meta_df[meta_df['index']==basename]
-                ground_truth_list = ast.literal_eval(list(filtered_meta['abundance'])[0])
-                ground_truth_list.extend(ast.literal_eval(list(filtered_meta['variant'])[0]))
-                ground_truth = ' '.join([str(x) for x in ground_truth_list])
-            except:
+                try:
+                    ground_truth_list = ast.literal_eval(list(filtered_meta['abundance'])[0])
+                    ground_truth_list.extend(ast.literal_eval(list(filtered_meta['variant'])[0]))
+                    ground_truth = ' '.join([str(x) for x in ground_truth_list])
+                    ground_truth = standardize_ground_truth(ground_truth)
+                except:
+                    continue 
+            if "simulated_" in file_output:
                 ground_truth = basename.split("_")
                 ground_truth = " ".join(ground_truth)
-
+            #we haven't accounted for this filetype yet
+            if ground_truth == 0 or 'aaron' in ground_truth:
+                continue            
             data = json.load(jfile)
             keys = list(data.keys())
-
+            print(ground_truth)
             #key is primer, value is percenets, mutations, haplotypes
             for k,v in data.items():
                 #if dictionary is empty keep going
@@ -1057,8 +1272,6 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
                 #related to the halotypes
                 if total_amp_depth < 10:
                     continue    
-                #if int(k) == 27701:
-                #    print(v)
                 haplotype_percents = v['haplotype_percents']
                 positions = v['poi']
                 position_freq = v['poi_freq']
@@ -1067,32 +1280,7 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
                 #keep going if we have no mutations on this amplicon
                 if len(haplotype_percents) == 0:
                     continue
-                
-                #TEST LINES                
-                
-                """                
-                if int(k) == 21865:
-                    print('primer', k,\
-                            'haplotype percents', haplotype_percents, \
-                            'position freq', position_freq, \
-                            'mutations', mutations, \
-                            'positions', positions) 
-                positions_to_remove = [] 
-                for i, a  in enumerate(position_freq):
-                    if len(a) == 1 and a[0] == -1 or a[0] > 0.98:
-                        print(k)
-                    #if a > 0.97 or a < 0.03:
-                    #   positions_to_remove.append(i)
-                position_freq = [a for i,a in enumerate(position_freq) \
-                        if i not in positions_to_remove]
-                positions = [a for i,a in enumerate(positions) \
-                        if i not in positions_to_remove]
-                
-                mutations = []
-                for mut in mutations_first:
-                    mut = [a for i,a in enumerate(mut) if i not in positions_to_remove]
-                    mutations.append(mut)
-                """
+                               
                 mutations = mutations_first
                 positions_to_remove = []
 
@@ -1118,7 +1306,6 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
                 binding_correct = test_amplicon(k, haplotype_percents, position_freq, mutations, positions)
                 done = False
                 if binding_correct is False:
-                    done=True
                     #print(k, position_freq, mutations, positions, haplotype_percents)                
                     for pk, pv in primer_dict.items():
                         if int(pv[0]) == int(k): 
@@ -1138,6 +1325,7 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
             all_cluster_centers = []
             all_sil=[]
             all_labels = []
+            all_bic = []
             
             total_haplotype_reshape = np.array(total_haplotype_freq).reshape(-1,1)
             total_mutation_flat = [item for sublist in total_mutation_freq for item in sublist]
@@ -1145,13 +1333,13 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
 
             lowest_value_highest_cluster = []
             highest_value_highest_cluster = [] 
-            
+            if len(total_haplotype_reshape) ==  0:
+                continue
             possible_explanations = list(range(2,6)) 
-            for num in possible_explanations:           
+            for num in possible_explanations:                          
                 #kmeans clustering
                 kmeans = KMeans(n_clusters=num, random_state=10).fit(total_haplotype_reshape)
                 centers = kmeans.cluster_centers_            
- 
                 flat_list = [item for sublist in centers for item in sublist]
                 all_cluster_centers.append(flat_list)                    
                 all_labels.append(kmeans.labels_)                
@@ -1169,17 +1357,23 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
                  
                 cluster_center_sums.append(sum(flat_list)) 
                 all_sil.append(silhouette_score(total_haplotype_reshape, kmeans.labels_))
-                
+                all_bic.append(compute_bic(kmeans, total_haplotype_reshape))
+               
                     
             #now we have negative files in place
             if len(all_sil) != 0:        
                 best_fit = max(all_sil)
                 loc = all_sil.index(best_fit)
+
+                #best_fit = min(all_bic)
+                #loc = all_bic.index(best_fit)
+
                 cluster_centers=all_cluster_centers[loc]
                 cluster_opt = possible_explanations[loc]
                 possible_threshold_low = lowest_value_highest_cluster[loc]
                 possible_threshold_high = highest_value_highest_cluster[loc]
                 act_sil = all_sil[loc]
+                act_bic = all_bic[loc]
                 used_labels = all_labels[loc]
                  
                 mismatched_primer_starts = []
@@ -1190,7 +1384,7 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
                 for k, v in primer_dict.items():
                     if k in improper_primers:
                         freq_flagged_starts.append(v[0])
-                
+                 
                 #let's graph the used labels and the haplotype freq/positons
                 graph_clusters(used_labels, cluster_centers, thf_condensed, total_positions, mf_condensed,
                     total_haplotype_freq, total_positions_extend, basename, ground_truth, total_amps, \
@@ -1209,7 +1403,7 @@ def group_files_analysis(file_folder, primer_dict, bam_dir):
                 temp_dict[file_output.replace(".json","").replace(file_folder+'/',"")]= {
                      'cluster_centers': cluster_centers,\
                      'sil_opt_cluster':cluster_opt,\
-                     'sil':act_sil,\
+                     'sil':act_sil, 'bic':act_bic, \
                      'threshold_low':possible_threshold, "threshold_high":possible_threshold_amb, \
                      'masked_primers': mismatched_primers, 'frequency_flagged_primers': improper_primers, \
                      'poor_primers': overlap_primers}
@@ -1246,9 +1440,6 @@ def test_amplicon(primer_0, haplotype_percents, position_freq, mutations, pos):
     that occur, and if they differ siginficantly return False.
     """
     correct=True
-    if str(primer_0) == '28800':
-        print(primer_0 , haplotype_percents, position_freq, mutations, pos)
-
     #we iterate through each haplotype frequency
     for hp,mut,pf in zip(haplotype_percents, mutations, position_freq):
         for f in pf:
@@ -1301,230 +1492,25 @@ def find_pure_file_mutations(pure_files, metadata, df):
 
     return(gt_dict)
 
-def variation_in_technical_replicates(metadata, df):
+def get_aa_from_position(positions):
     """
-    Creates plots looking at the variance of technical replicates.
+    Given a list of positions return the gene:aa code.
     """
-    technical_replicates = {}
-
-    #generate dict of technical replicates
-    for index, row in metadata.iterrows():
-        filename = row['index']
-        try:
-            var = ast.literal_eval(row['variant'])
-        except:
-            var = ['Negative']
-        abun = ast.literal_eval(row['abundance'])
-        abun = [str(round(x,2)) for x in abun]
-        var = [x.lower() for x in var]
-        string_key = '_'.join(var) + '_' + '_'.join(abun)     
-        if string_key in technical_replicates:
-            technical_replicates[string_key].append(filename)
-        else:
-            technical_replicates[string_key] = [filename]
-    
-    #shows sils versus percent breakdowns
-    sil_percent_dict = {}
-    
-    #for sil boxplots 
-    box_x=[]
-    box_y=[]
-
-    #compare values for technical replicates
-    for key, value in technical_replicates.items():
-        var = key.split("_")
-        var = var[:int(len(var)/2)]
-        var = '_'.join(var)
-        
-        df_filtered = df[df['index'].isin(value)]
-        meta_filtered = metadata[metadata['index'].isin(value)]
-        #print(df_filtered)
-        #print(meta_filtered.columns)
-        #print(meta_filtered['threshold'])
-        #print(meta_filtered['threshold_amb'])
-        sils = meta_filtered['sil'].tolist()
-        if len(sils) < 2:
-            continue
+    gene_table = "../gene_result.txt"
+    gene_df = pd.read_table(gene_table, usecols=['start_position_on_the_genomic_accession', \
+        'end_position_on_the_genomic_accession', 'Symbol'])    
    
-        percent_breakdown = key.split("_")
-        perc = []
-        for pb in percent_breakdown:
-            try:
-                perc.append(float(pb))
-            except:
-                pass
-        temp_key = ''
-        if 95 in perc:
-            temp_key='95/5'
-        elif 100 in perc:
-            temp_key='100'
-        elif 90 in perc:
-            temp_key='90/10'
-        elif 80 in perc:
-            temp_key='80/20'
-        elif 60 in perc:
-            temp_key='60/40'
-        elif 50 in perc:
-            temp_key='50/50'
-        elif 33.33 in perc:
-            temp_key='33*3'
-        elif 25 in perc:
-            temp_key='25*4'
-        elif 20 in perc:
-            temp_key='20*5'
-        box_x.extend([temp_key]*len(sils))
-        box_y.extend(sils)
-        if temp_key in sil_percent_dict:
-            if var in sil_percent_dict[temp_key]:
-                sil_percent_dict[temp_key][var]=sils
-            else:
-                sil_percent_dict[temp_key][var] = sils
-        else:
-            sil_percent_dict[temp_key] = {var:sils}
-    
-    #relationship between percents and sil scores
-    order= ['95/5','90/10','80/20','60/40','50/50','33*3','25*4','20*5']
+    aa_list = []
+    for position in positions: 
+        for index, row in gene_df.iterrows():
+            start = int(row['start_position_on_the_genomic_accession'])
+            end = int(row['end_position_on_the_genomic_accession'])
+            if start < position < end:
+                gene_str = row['Symbol']
+                aa = int((position-start)/3)+1
+                aa_list.append(gene_str + ":" + str(aa))
 
-    box_x_f = []
-    box_y_f = []
-    #we don't want to even visualize the 100% samples
-    for i,(x,y) in enumerate(zip(box_x, box_y)):
-        if str(x) == "100":
-            continue
-        else:
-            box_x_f.append(x)
-            box_y_f.append(y)
-
-    sns.set_style("whitegrid")
-    sns.boxplot(x=box_x_f, y=box_y_f, order=order)
-    plt.xlabel("Ratio of Variants in Samples")
-    plt.ylim(0,1)
-    plt.ylabel("Silhouette Score")
-    plt.axhline(y=0.80, color='orange',linewidth=2)
-    #plt.title("relationship between sil score and variants ratio")
-    plt.tight_layout() 
-    plt.savefig("sil_ratio_boxplot.png")
-    plt.close()
-    
-    all_var = []
-    #variance among technical replicate sil scores
-    for key, value in sil_percent_dict.items():  
-        
-        for k,sils in value.items():
-            
-            if len(sils) < 3:
-                continue
-            variance = statistics.variance(sils)
-            if max(sils)-min(sils) > 0.1:
-                print(k, key, sils)
-            all_var.append(max(sils)-min(sils))
-            all_var.append(variance)
-    #print(all_var)
-    sns.distplot(all_var)
-    plt.xlabel("distance between max/min thresholds selected for the same file type (percent/variant)")
-    plt.title("threshold similarity among the same file type")
-    plt.savefig("dist_var.png")
-    plt.close()
-
-    sys.exit(0)
-
-def single_file_mutation_graph(files, gt_dict, metadata, df):
-    single_file = [files[0]]
-    #files =['file_109', 'file_110']
-    seqNames = df['seqName'].tolist()
-    seqNames_filt = ["file_"+x.split("_")[2] for x in seqNames]
-    percent = [x.split("_")[3] for x in seqNames]
-    df['index'] = seqNames_filt
-    df['threshold'] = percent
-    df_filtered = df[df['index'].isin(files)]
-    metadata_filtered = df_filtered.merge(metadata, on='index', how='left')
-    gt = gt_dict['alpha']
-
-    #handle the other element of the file
-    gt_2 = gt_dict['gamma']
-    val_sub_2 = [x for x in list(np.unique(gt_2['sub'])) if x.startswith("S")]
-    val_ins_2 = [x for x in list(np.unique(gt_2['ins'])) if x.startswith("S")]
-    val_del_2 = [x for x in list(np.unique(gt_2['dele'])) if x.startswith("S")]
-    total_2=val_sub_2
-    total_2.extend(val_ins_2)
-    total_2.extend(val_del_2)
-
-    val_sub = [x for x in list(np.unique(gt['sub'])) if x.startswith("S")]
-    val_ins = [x for x in list(np.unique(gt['ins'])) if x.startswith("S")]
-    val_del = [x for x in list(np.unique(gt['dele'])) if x.startswith("S")]
-    total = val_sub
-    total.extend(val_ins)
-    total.extend(val_del)
-    order = np.unique(metadata_filtered['threshold_x']).tolist()
-    order.sort(reverse=True)
-    
-    shape = int(len(metadata_filtered)/len(files))
-    heat = np.zeros((len(order),len(total)))
-    heat_2 = np.zeros((len(order),len(total_2)))
-    divisor = [0.0]*len(order)
-    for index, row in metadata_filtered.iterrows():    
-        try:
-            ins = row['aaInsertions'].split(',')
-        except:
-            ins=[]
-        try:
-            #print(row['threshold_x'], row['aaDeletions'])
-            dele = row['aaDeletions'].split(',')
-        except:
-            dele=[]
-        try:
-            #print(row['threshold_x'], row['aaSubstitutions'])
-            sub = row['aaSubstitutions'].split(',')
-
-        except:
-            sub=[]
-        loc2 =order.index(row['threshold_x'])
-        divisor[loc2] += 1
-        for i in ins:
-            if i in val_ins_2:
-                loc = total_2.index(i)
-                heat_2[loc2][loc] += 1
-            
-            if i in val_ins:
-                loc = total.index(i)
-                heat[loc2][loc] += 1
-        
-        for s in sub:
-            #check if the sub is in ground truth
-            if s in val_sub:
-                loc = total.index(s)
-                heat[loc2][loc] += 1
-            if s in val_sub_2:
-                loc = total_2.index(s)
-                heat_2[loc2][loc] += 1
-        
-        for d in dele:
-            #check if the del is in ground truth
-            if d in val_del:
-                loc = total.index(d)
-                loc2 =order.index(row['threshold_x'])
-                heat[loc2][loc] += 1
-            if d in val_del_2:
-                loc = total_2.index(d)
-                heat_2[loc2][loc] += 1
- 
-    heat = heat/np.array(divisor)[:,None]
-    heat_2 = heat_2/np.array(divisor)[:,None]
-    
-    fig, (ax1, ax2) = plt.subplots(1,2)
-    sns.heatmap(heat, yticklabels=order, xticklabels=val_sub, square=False, ax=ax1, cbar=False)
-    #ax1.axhline(y=0.98, color='orange',linewidth=2 )
-    ax1.set(xlabel='alpha', ylabel='consensus threshold used')
-    sns.heatmap(heat_2, yticklabels=order, xticklabels=val_sub_2, square=False, ax=ax2, cbar=False)
-    ax2.set(xlabel='gamma')
-     
-    #plt.ylim(0,1)
-    #plt.ylabel("consensus threshold used")
-    #plt.axhline(y=0.80, color='orange',linewidth=2)
-    #plt.title("10/90 mutations recovered gamma/alpha")
-    plt.tight_layout() 
-    plt.savefig("heat_10_90_gamma_alpha.png")
-    plt.close()
+    return(aa_list)
 
 def parse_key_mutations():
     mutations_table = "../key_mutations.csv"
@@ -1569,25 +1555,49 @@ def graph_clusters(used_labels, used_centers, thf_condensed, positions, mutation
     """
     Function takes in the labels, cluster labels, and positions and graphs them.
     """
-    print("creating graph plot")
-    total_pos_dict = parse_key_mutations()
-    #print(total_pos_dict)
+    strain_1 = ground_truth.split(" ")[1]
+    strain_2 = ground_truth.split(" ")[2]
+     
+    strain_1_muts = get_mutations_vcf(strain_1)
+    if strain_2 != "none":
+        strain_2_muts = get_mutations_vcf(strain_2)
+        overlap = [x for x in strain_1_muts if x in strain_2_muts]
+    else:
+        overlap = []
+    total_pos_dict = {}
+    total_pos_dict[strain_1] = [x for x in strain_1_muts if x not in overlap]
+    if strain_2 != "none":
+        total_pos_dict[strain_2] = [x for x in strain_2_muts if x not in overlap]
+    total_pos_dict['both linages'] = overlap
+
+    #total_pos_dict = parse_key_mutations() 
     count = 0
         
     total_lineages = []
     pos_refactor = []
+    """
+    print("mutations", len(mutations), \
+          "postions", len(positions), \
+          "thf condensed", len(thf_condensed)
+         )
+    """
+    
     #let's expand to associate certain lineages with a haplotype
-    for c, (pos, muts) in enumerate(zip(positions, mutations)):
+    for c, (pos, muts, thf) in enumerate(zip(positions, mutations, thf_condensed)):
+        #print(pos, 'muts', muts, 'thf', thf)
+        
         #this iterates at the haplotype level
-        for z,mut in enumerate(muts):
+        for z,(mut,hf) in enumerate(zip(muts,thf)):
             remove = []
             for i,m in enumerate(mut):
                 if m == 0:
-                    remove.append(i)    
-            p = [x for i,x in enumerate(pos) if i not in remove]    
-            found_lin = "None"
+                    remove.append(i)
             
+            p = [x for i,x in enumerate(pos) if i not in remove]    
+                     
+            found_lin = "None" 
             for p1 in p:
+                p1 += 1
                 label = used_labels[count]
                 for k,v in total_pos_dict.items():
                     if p1 in v:
@@ -1595,9 +1605,10 @@ def graph_clusters(used_labels, used_centers, thf_condensed, positions, mutation
                         break
                 if found_lin != "None":
                     break
-            pos_refactor.append(pos)
+            pos_refactor.append(p)
             total_lineages.append(found_lin)
-    """
+    
+    """    
     print(
         "total lineages", len(total_lineages), "\n",
         "used labels", len(used_labels), "\n",
@@ -1613,65 +1624,288 @@ def graph_clusters(used_labels, used_centers, thf_condensed, positions, mutation
         for lab in unique_labels:
             combination_total.append(str(ul)+"_"+str(lab)) 
 
-    markers = [',', 'X', 'o', 'v', '^', '<', '>', '8', 's', 'p', '*', 'h', 'H', 'D', 'd', 'P', '.']
-    colors = ['orange', 'purple', 'green', 'blue', 'red']
+    line_1 = [] #cluster larger strain 1
+    line_2 = [] #cluster larger strain 2
+    line_3 = [] #cluster smaller strain 1
+    line_4 = [] #cluster smaller strain 2
+    line_5 = [] #cluster smallest strain 1
+    line_6 = [] #cluster smallest strain 2
 
-    m_list = []
-    c_list = []
-    h_list = []
+    line_7 = [] #cluster smaller strain 1
+    line_8 = [] #cluster smaller strain 2
+    ordered_centers = copy.deepcopy(used_centers)
+    ordered_centers.sort(reverse=True)
+    
+    if len(used_centers) == 2:
+        cluster_1_label = used_centers.index(ordered_centers[0])
+        cluster_2_label = used_centers.index(ordered_centers[1])
+    elif len(used_centers) == 3:
+        cluster_1_label = used_centers.index(ordered_centers[0])
+        cluster_2_label = used_centers.index(ordered_centers[2])
+        cluster_3_label = used_centers.index(ordered_centers[2])
+    else:
+        print(len(used_centers))
+        return
+    gt_list = ground_truth.split(" ")
+    strain_1_label = gt_list[2] #expected larger strain
+    strain_2_label = gt_list[1] #expected smaller strain
+    df = pd.DataFrame({"charactertistic lineage":total_lineages, "cluster":used_labels, \
+        "frequency":total_haplotype_freq, \
+        'cluster - strain': [str(x) + '-' + str(y) for x,y in zip(used_labels, total_lineages)]})
+
     
     for tl, ul, thf in zip(total_lineages, used_labels, \
-        total_haplotype_freq): 
-        marker_loc = unique_lineages.index(tl)
-        color_loc = unique_labels.index(ul)
-        m_list.append(tl)
-        c_list.append(ul)
-        h_list.append(thf)
-        
-   
-    y = []
-    for m,c in zip(m_list,c_list):
-        loc_s = str(m)+"_"+str(c)        
-        y.append(combination_total.index(loc_s))
-    mark = markers[:len(np.unique(m_list))]  
-    c_list = ['cluster '+str(x) for x in c_list]
-    sns.scatterplot(h_list, y, hue=c_list, style=m_list, markers=mark)
-    sns.despine(top=True, right=True, left=True, bottom=False)
+        total_haplotype_freq):
+ 
+        if ul == cluster_1_label and tl == strain_1_label:
+            line_1.append(thf)
+        elif ul == cluster_2_label and tl == strain_1_label:
+            line_2.append(thf)
+        elif ul == cluster_1_label and tl == strain_2_label:
+            line_3.append(thf)
+        elif ul == cluster_2_label and tl ==strain_2_label:
+            line_4.append(thf)
+        elif ul == cluster_1_label and tl == "None":
+            line_5.append(thf)
+        elif ul == cluster_2_label and tl == "None":
+            line_6.append(thf)
+        elif ul == cluster_1_label and tl == "both lineages":
+            line_7.append(thf)
+        elif ul == cluster_2_label and tl == "both lineages":
+            line_8.append(thf)
 
-    plt.title("%s Clustering Results by Lineage Haplotype and Frequency" %ground_truth, fontsize=7) 
-    plt.yticks([])
-    plt.xlabel("Haplotype Frequency") 
-    plt.legend(bbox_to_anchor=(0.90, 1), loc='upper left', borderaxespad=0)
-    plt.savefig("./figures/%s_event_plot.png" %ground_truth)
+
+    plt.clf()
     plt.close()
-     
-    #pick out signals that belong to the wrong cluster
-    dist_cluster_1 = []
-    dist_cluster_2 = []
-    amp_cluster_1 = []
-    amp_cluster_2 = []
-    pos_cluster_1 = []
-    pos_cluster_2 = []
 
-    #print(mismatched_primer_starts)
-    for tl, ul, thf, tp,a in zip(total_lineages, used_labels, \
-        total_haplotype_freq, pos_refactor, amps):
-        if ul == 0 and tl == "gamma":
-            print(tl, ul, thf, tp, a)
-        if ul == 0:
-            dist_cluster_1.append(abs(used_centers[1]-thf))
-            amp_cluster_1.append(a)
-            pos_cluster_1.append(tp)
-        if ul == 1:
-            dist_cluster_2.append(abs(used_centers[0]-thf))
-            amp_cluster_2.append(a)
-            pos_cluster_2.append(tp)
+    #plt.figure(figsize=(12, 12), dpi=80)
+    fig, (ax1, ax3, ax5, ax7) = plt.subplots(4, 1, figsize=(8,8))
+ 
+    #for strain 1
+    sns.kdeplot(x=line_1, ax = ax1, color='purple', shade=True)
+    sns.kdeplot(x=line_2, ax = ax1, color='orange', shade=True)
+    plt.setp(ax1, xlim=(0,1))
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    ax1.set(xlabel=None)
+    ax1.set(ylabel='%s Mutations' %strain_1_label)
+    ax1.set(yticklabels=[])
+    ax1.set(xticklabels=[])
+    ax1.tick_params('both', length=0)
 
-    dist_cluster_1, amp_cluster_1, pos_cluster_1 = zip(*sorted(zip(dist_cluster_1, amp_cluster_1, pos_cluster_1), reverse=True))
-    #print(dist_cluster_1, "\n", amp_cluster_1, "\n", pos_cluster_1)
+    #for strain 2
+    sns.kdeplot(x=line_3, ax = ax3, color='purple', shade = True)
+    sns.kdeplot(x=line_4, ax = ax3, color='orange', shade = True)
+    plt.setp(ax3, xlim=(0,1))
+    ax3.spines['top'].set_visible(False)
+    ax3.spines['right'].set_visible(False)
+    ax3.set(xlabel=None)
+    ax3.set(ylabel='%s Mutations' %strain_2_label)
+    ax3.set(yticklabels=[])
+    ax3.set(xticklabels=[])   
+    ax3.tick_params('both', length=0)
+  
+    #None labeled mutations
+    sns.kdeplot(x=line_5, ax = ax5, color='purple', shade=True)
+    sns.kdeplot(x=line_6, ax = ax5, color='orange', shade=True)
+    plt.setp(ax5, xlim=(0,1))
+    ax5.spines['top'].set_visible(False)
+    ax5.spines['right'].set_visible(False)
+    ax5.set(xlabel=None)
+    ax5.set(ylabel="Simulated Noise")
+    ax5.set(yticklabels=[])   
+    ax5.set(xticklabels=[])   
+    ax5.tick_params('both', length=0)
     
-    dist_cluster_2, amp_cluster_2, pos_cluster_2 = zip(*sorted(zip(dist_cluster_2, amp_cluster_2, pos_cluster_2), reverse=True))
-    #print(dist_cluster_2, "\n", amp_cluster_2, "\n", pos_cluster_2) 
+    #both lineages labeled mutations
+    sns.kdeplot(x=line_7, ax = ax7, color='purple', shade=True)
+    sns.kdeplot(x=line_8, ax = ax7, color='orange', shade=True)
+    plt.setp(ax7, xlim=(0,1))
+    ax7.spines['top'].set_visible(False)
+    ax7.spines['right'].set_visible(False)
+    ax7.set(xlabel="Haplotype Frequency")
+    ax7.set(ylabel='Both Lineages')
+    ax7.set(yticklabels=[])    
+    ax7.tick_params('y', length=0)
+
+ 
+    #sns.despine(top=True, right=True, left=True, bottom=False)
+    #plt.title("%s Clustering Results by Lineage Haplotype and Frequency" %ground_truth, fontsize=7) 
+    #plt.xlabel("Haplotype Frequency") 
+    purple_patch = mpatches.Patch(color='purple', label='Cluster 1')
+    orange_patch = mpatches.Patch(color='orange', label='Cluster 2')
+    plt.savefig("./figures/%s_event_plot.png" %ground_truth)
+    plt.clf()
+    plt.close()
+    
+     
+def get_mutations_vcf(strain):
+    """
+    Parameters
+    ----------
+    strain : str 
+        The strain to parse.
+
+    Returns
+    -------
+    mut_positions : list
+        List of positions where we have mutations.
+
+    Given a straing open the corresponding vcf file and return
+    a list of expected mutation positions.    
+    """
+    vcf_file_location = "../simulated_data/simulated_vcf/%s_mod.vcf" %strain
+    mut_positions = []
+    with open(vcf_file_location, 'r') as vfile:
+        for line in vfile:
+            line = line.strip()
+            if line.startswith("#"):
+                continue
+            line_list = line.split("\t")
+            mut_positions.append(int(line_list[1]))
+    return(mut_positions)
+
+def standardize_ground_truth(label):
+    """
+    Parameters
+    ----------
+    label : str
+    """
+    order_list = ['50/50', '45/55', '40/60', \
+              '35/65', '30/70', '25/75', '20/80', \
+              '15/85', '10/90', '05/95', '0/100']
+    strain_1 = ''
+    strain_2 = ''
+    percent_1 = ''
+    percent_2 = ''
+    label_list = label.split(" ")
+ 
+    if "100.0" in label:
+        label_list = label.split(" ")
+        strain_1 = label_list[1].lower()
+        strain_2 = "none"
+        percent_1 = str(100)
+        percent_2 = str(0)
+        return_string  = "wastewater " + strain_1 + " " + strain_2 + " " + percent_1 + " " + percent_2
+    elif len(label_list) == 4:
+        percent_1 = str(int(float(label_list[0])))
+        percent_2 = str(int(float(label_list[1])))
+        strain_1 = label_list[2].lower()
+        strain_2 = label_list[3].lower()
+        return_string  = "wastewater " + strain_1 + " " + strain_2 + " " + percent_1 + " " + percent_2
+    elif len(label_list) == 6:
+        percent_1 = "33"
+        percent_2 = "33"
+        percent_3 = "33"
+        strain_1 = label_list[3].lower()
+        strain_2 = label_list[4].lower() 
+        strain_3 = label_list[5].lower() 
+        return_string  = "wastewater " + strain_1 + " " + strain_2 + " " + strain_3 + " " + percent_1 + " " + percent_2 + " " + percent_3
+    elif len(label_list) == 8:
+        percent_1 = "25"
+        percent_2 = "25"
+        percent_3 = "25"
+        percent_4 = "25"
+        strain_1 = label_list[4].lower()
+        strain_2 = label_list[5].lower() 
+        strain_3 = label_list[6].lower() 
+        strain_4 = label_list[7].lower() 
+        return_string  = "wastewater " + strain_1 + " " + strain_2 + " " + strain_3 + " " + strain_4 + " " + percent_1 + " " + percent_2 + " " + percent_3 + " " + percent_4
+    elif len(label_list) == 10:
+        percent_1 = "20"
+        percent_2 = "20"
+        percent_3 = "20"
+        percent_4 = "20"
+        percent_5 = "20"
+        strain_1 = label_list[5].lower()
+        strain_2 = label_list[6].lower() 
+        strain_3 = label_list[7].lower() 
+        strain_4 = label_list[8].lower() 
+        strain_5 = label_list[9].lower() 
+        return_string  = "wastewater " + strain_1 + " " + strain_2 + " " + strain_3 + " " + strain_4 + " " + strain_5 + " " + percent_1 + " " + percent_2 + " " + percent_3 + " " + percent_4 + " "+ percent_5
+    else:
+        return(0)
+    
+    return(return_string)
+
+def reformat_metadata(df):
+    """
+    """
+    
+    columns = {"filename":[], "strain_1": [], "strain_2":[], "strain_3":[], "strain_4": [], \
+        "strain_5":[], "percent_1":[], "percent_2":[], "percent_3":[], "percent_4":[], "percent_5":[], \
+        "reads_1":[], "reads_2":[], "reads_3":[], "reads_4":[], "reads_5":[], "total_reads":[]} 
+    for index, row in df.iterrows():
+        try:
+            variants = ast.literal_eval(row['variant'])
+        except:
+            continue
+        abundances = ast.literal_eval(row['abundance(%)'])
+        i = 0
+        temp_abundances = ["None"]*5
+        temp_variants = ["None"]*5
+        temp_abundances[0] = 0
+        temp_abundances[1] = 0
+        for v, a in zip(variants, abundances):
+            temp_abundances[i] = a
+            temp_variants[i] = v.lower()
+            i += 1 
+        columns['filename'].append(row['filename'].replace(".bam",""))
+        columns['percent_1'].append(temp_abundances[0])
+        columns['percent_2'].append(temp_abundances[1])
+        columns['percent_3'].append(temp_abundances[2])
+        columns['percent_4'].append(temp_abundances[3])
+        columns['percent_5'].append(temp_abundances[4])
+        columns['strain_1'].append(temp_variants[0])
+        columns['strain_2'].append(temp_variants[1])
+        columns['strain_3'].append(temp_variants[2])
+        columns['strain_4'].append(temp_variants[3])
+        columns['strain_5'].append(temp_variants[4])
+        columns['reads_1'].append(temp_abundances[0])
+        columns['reads_2'].append(temp_abundances[1])
+        columns['reads_3'].append(temp_abundances[2])
+        columns['reads_4'].append(temp_abundances[3])
+        columns['reads_5'].append(temp_abundances[4])
+        columns['total_reads'].append(100)
+    df = pd.DataFrame(columns)
+    return(df)
+
+def compute_bic(kmeans,X):
+    """
+    Computes the BIC metric for a given clusters
+
+    Parameters:
+    -----------------------------------------
+    kmeans:  List of clustering object from scikit learn
+
+    X     :  multidimension np array of data points
+
+    Returns:
+    -----------------------------------------
+    BIC value
+    """
+    # assign centers and labels
+    centers = [kmeans.cluster_centers_]
+    labels  = kmeans.labels_
+    #number of clusters
+    m = kmeans.n_clusters
+    # size of the clusters
+    n = np.bincount(labels)
+    #size of data set
+    N, d = X.shape
+
+    #compute variance for all clusters beforehand
+    cl_var = (1.0 / (N - m) / d) * sum([sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 
+             'euclidean')**2) for i in range(m)])
+
+    const_term = 0.5 * m * np.log(N) * (d+1)
+
+    BIC = np.sum([n[i] * np.log(n[i]) -
+               n[i] * np.log(N) -
+             ((n[i] * d) / 2) * np.log(2*np.pi*cl_var) -
+             ((n[i] - 1) * d/ 2) for i in range(m)]) - const_term
+
+    return(BIC)
 
 if __name__ == "__main__":
     main()
